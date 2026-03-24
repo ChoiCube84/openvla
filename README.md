@@ -47,6 +47,12 @@ This launcher performs, in order:
 
 The launcher is intentionally **zero-argument** for the default path.
 
+GPU selection is launcher-level:
+
+- if `OPENVLA_MANISKILL_VISIBLE_DEVICES_OVERRIDE` is set, the launcher uses that value directly
+- else if `OPENVLA_MANISKILL_GPU_INDEX` is set, the launcher uses that physical GPU index
+- else the launcher auto-selects the least-used GPU reported by `nvidia-smi`
+
 ## Installation on the Cluster
 
 From the repository root:
@@ -55,6 +61,16 @@ From the repository root:
 pip install -e .
 pip install -r experiments/robot/libero/libero_requirements.txt
 pip install mani_skill gymnasium imageio imageio-ffmpeg draccus
+pip install packaging ninja psutil
+ninja --version
+pip install "flash-attn==2.5.5" --no-build-isolation
+```
+
+If `flash-attn` fails on the first try, a common retry is:
+
+```bash
+pip cache remove flash_attn
+MAX_JOBS=4 pip install "flash-attn==2.5.5" --no-build-isolation
 ```
 
 If your cluster requires a specific PyTorch/CUDA installation path, install the correct Torch build in the `openvla` environment first.
@@ -167,6 +183,12 @@ QA-only launcher failure path for GPU visibility:
 
 ```bash
 OPENVLA_MANISKILL_VISIBLE_DEVICES_OVERRIDE='' bash cluster/run_openvla_maniskill_benchmark.sh
+```
+
+Pick a specific physical GPU yourself:
+
+```bash
+OPENVLA_MANISKILL_GPU_INDEX=1 bash cluster/run_openvla_maniskill_benchmark.sh
 ```
 
 ## File Guide

@@ -8,6 +8,16 @@ From repo root:
 pip install -e .
 pip install -r experiments/robot/libero/libero_requirements.txt
 pip install mani_skill gymnasium imageio imageio-ffmpeg draccus
+pip install packaging ninja psutil
+ninja --version
+pip install "flash-attn==2.5.5" --no-build-isolation
+```
+
+Retry pattern if `flash-attn` build fails:
+
+```bash
+pip cache remove flash_attn
+MAX_JOBS=4 pip install "flash-attn==2.5.5" --no-build-isolation
 ```
 
 Use the same environment that runs `python experiments/robot/maniskill/run_maniskill_eval.py`.
@@ -38,13 +48,26 @@ export OPENVLA_MANISKILL_CHECKPOINT="/path/to/openvla-run"
 bash cluster/run_openvla_maniskill_benchmark.sh
 ```
 
-Default GPU mapping is launcher-level (`CUDA_VISIBLE_DEVICES=3`).
+Default GPU mapping is launcher-level.
 
 Optional env controls:
 
 - `OPENVLA_MANISKILL_CONDA_ENV` (default: `openvla`)
 - `OPENVLA_MANISKILL_SKIP_CONDA_ACTIVATE=1` (skip `conda activate`)
+- `OPENVLA_MANISKILL_GPU_INDEX` (pick a specific physical GPU index)
 - `OPENVLA_MANISKILL_VISIBLE_DEVICES_OVERRIDE` (QA-only override of `CUDA_VISIBLE_DEVICES`)
+
+Default behavior:
+
+- if `OPENVLA_MANISKILL_VISIBLE_DEVICES_OVERRIDE` is set, the launcher uses it directly
+- else if `OPENVLA_MANISKILL_GPU_INDEX` is set, the launcher uses that physical GPU index
+- else the launcher auto-selects the least-used GPU from `nvidia-smi`
+
+Choose a specific GPU explicitly:
+
+```bash
+OPENVLA_MANISKILL_GPU_INDEX=1 bash cluster/run_openvla_maniskill_benchmark.sh
+```
 
 QA failure-path check (forces setup failure before benchmark execution):
 

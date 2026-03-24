@@ -8,6 +8,36 @@ log() {
   printf '[openvla-maniskill] %s\n' "$*"
 }
 
+choose_gpu_index() {
+  python - <<'PY'
+import subprocess
+import sys
+
+cmd = [
+    "nvidia-smi",
+    "--query-gpu=index,memory.used,utilization.gpu",
+    "--format=csv,noheader,nounits",
+]
+result = subprocess.run(cmd, capture_output=True, text=True)
+if result.returncode != 0:
+    sys.exit(result.returncode)
+
+rows = []
+for line in result.stdout.splitlines():
+    parts = [part.strip() for part in line.split(",")]
+    if len(parts) != 3:
+        continue
+    idx, mem, util = map(int, parts)
+    rows.append((mem, util, idx))
+
+if not rows:
+    raise SystemExit(1)
+
+rows.sort()
+print(rows[0][2])
+PY
+}
+
 OPENVLA_MANISKILL_CONDA_ENV="${OPENVLA_MANISKILL_CONDA_ENV:-openvla}"
 if [[ "${OPENVLA_MANISKILL_SKIP_CONDA_ACTIVATE:-0}" != "1" ]]; then
   if command -v conda >/dev/null 2>&1; then
@@ -26,8 +56,12 @@ fi
 
 if [[ "${OPENVLA_MANISKILL_VISIBLE_DEVICES_OVERRIDE+x}" == "x" ]]; then
   export CUDA_VISIBLE_DEVICES="${OPENVLA_MANISKILL_VISIBLE_DEVICES_OVERRIDE}"
+elif [[ -n "${OPENVLA_MANISKILL_GPU_INDEX:-}" ]]; then
+  export CUDA_VISIBLE_DEVICES="${OPENVLA_MANISKILL_GPU_INDEX}"
 else
-  export CUDA_VISIBLE_DEVICES="3"
+  AUTO_GPU_INDEX="$(choose_gpu_index)"
+  export CUDA_VISIBLE_DEVICES="${AUTO_GPU_INDEX}"
+  export OPENVLA_MANISKILL_GPU_INDEX="${AUTO_GPU_INDEX}"
 fi
 log "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 

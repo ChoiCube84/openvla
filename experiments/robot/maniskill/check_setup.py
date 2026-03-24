@@ -14,7 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 from experiments.robot.maniskill.defaults import (
     ARTIFACT_ROOT,
     CHECKPOINT_POLICY,
-    DEFAULT_GPU_INDEX,
+    DEFAULT_GPU_INDEX_ENV_KEY,
     FULL_EPISODE_COUNT_PER_TASK,
     RAW_FRAME_LAYOUT_CONTRACT,
     SEED_POLICY,
@@ -56,8 +56,7 @@ def _validate_checkpoint_layout(checkpoint_target: str) -> None:
         if checkpoint_path.suffix != ".pt" or checkpoint_path.parent.name != "checkpoints":
             fail(
                 "CHECKPOINT_MISSING",
-                "Expected a `.pt` file under a `checkpoints/` directory "
-                f"but got `{checkpoint_path}`.",
+                f"Expected a `.pt` file under a `checkpoints/` directory but got `{checkpoint_path}`.",
             )
         run_dir = checkpoint_path.parents[1]
     elif checkpoint_path.is_dir():
@@ -86,53 +85,67 @@ def _validate_gpu_policy() -> None:
         fail("GPU_POLICY_UNAVAILABLE", f"Unable to import `torch` for CUDA check: {exc}")
 
     if not torch.cuda.is_available():
+        required_gpu_index = os.environ.get(DEFAULT_GPU_INDEX_ENV_KEY, "").strip()
+        required_label = required_gpu_index if required_gpu_index else "auto/visible"
         fail(
             "GPU_POLICY_UNAVAILABLE",
-            f"CUDA is unavailable; required GPU index is {DEFAULT_GPU_INDEX}.",
+            f"CUDA is unavailable; required GPU index is {required_label}.",
         )
 
     gpu_count = torch.cuda.device_count()
+    required_gpu_index_raw = os.environ.get(DEFAULT_GPU_INDEX_ENV_KEY, "").strip()
+    required_gpu_index = None
+    if required_gpu_index_raw:
+        try:
+            required_gpu_index = int(required_gpu_index_raw)
+        except ValueError:
+            fail(
+                "GPU_POLICY_UNAVAILABLE",
+                f"`{DEFAULT_GPU_INDEX_ENV_KEY}` must be an integer physical GPU index, got `{required_gpu_index_raw}`.",
+            )
+
     visible_devices_raw = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible_devices_raw is not None:
         visible_devices = [entry.strip() for entry in visible_devices_raw.split(",") if entry.strip()]
-        required_device = str(DEFAULT_GPU_INDEX)
-        if required_device not in visible_devices:
+        if required_gpu_index is not None and str(required_gpu_index) not in visible_devices:
             fail(
                 "GPU_POLICY_UNAVAILABLE",
-                "CUDA_VISIBLE_DEVICES does not include required physical GPU "
-                f"{DEFAULT_GPU_INDEX}: `{visible_devices_raw}`.",
+                f"CUDA_VISIBLE_DEVICES does not include required physical GPU {required_gpu_index}: `{visible_devices_raw}`.",
             )
         if gpu_count < 1:
             fail(
                 "GPU_POLICY_UNAVAILABLE",
-                "CUDA_VISIBLE_DEVICES includes required GPU but no CUDA device is visible to Python.",
+                "CUDA_VISIBLE_DEVICES is set but no CUDA device is visible to Python.",
             )
         return
 
-    if gpu_count <= DEFAULT_GPU_INDEX:
+    if required_gpu_index is not None and gpu_count <= required_gpu_index:
         fail(
             "GPU_POLICY_UNAVAILABLE",
-            "No CUDA_VISIBLE_DEVICES mapping found and required physical GPU "
-            f"{DEFAULT_GPU_INDEX} is missing; only {gpu_count} GPU(s) detected.",
+            f"No CUDA_VISIBLE_DEVICES mapping found and required physical GPU {required_gpu_index} is missing; only {gpu_count} GPU(s) detected.",
         )
+
+    if gpu_count < 1:
+        fail("GPU_POLICY_UNAVAILABLE", "No CUDA devices detected.")
+
+
 
 
 def _validate_maniskill_import() -> None:
     try:
-        importlib.import_module("mani_skill")
+        _ = importlib.import_module("mani_skill")
     except Exception as exc:
         fail("MANISKILL_DEPENDENCY_MISSING", f"Unable to import `mani_skill`: {exc}")
 
 
 def _validate_renderer_dependencies() -> None:
     try:
-        importlib.import_module("imageio")
-        importlib.import_module("imageio_ffmpeg")
+        _ = importlib.import_module("imageio")
+        _ = importlib.import_module("imageio_ffmpeg")
     except Exception as exc:
         fail(
             "RENDERER_DEPENDENCY_MISSING",
-            "Missing video/render dependency for `imageio[ffmpeg]`: "
-            f"{exc}",
+            f"Missing video/render dependency for `imageio[ffmpeg]`: {exc}",
         )
 
 
@@ -170,8 +183,7 @@ def _validate_disk_budget() -> None:
     if usage.free < min_free_disk_bytes:
         fail(
             "DISK_BUDGET_UNAVAILABLE",
-            f"Free space at `{target_path}` is {usage.free} bytes; requires at least "
-            f"{min_free_disk_bytes} bytes for `{RAW_FRAME_LAYOUT_CONTRACT.get('retention')}`.",
+            f"Free space at `{target_path}` is {usage.free} bytes; requires at least {min_free_disk_bytes} bytes for `{RAW_FRAME_LAYOUT_CONTRACT.get('retention')}`.",
         )
 
 

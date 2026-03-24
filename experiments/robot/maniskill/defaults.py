@@ -1,6 +1,7 @@
 TASK_IDS = ["PickCube-v1", "PushCube-v1", "StackCube-v1"]
 
-DEFAULT_GPU_INDEX = 3
+DEFAULT_GPU_INDEX_ENV_KEY = "OPENVLA_MANISKILL_GPU_INDEX"
+DEFAULT_GPU_INDEX = None
 EXEMPLAR_LIMITS = {"success": 2, "failure": 2}
 ARTIFACT_ROOT = "rollouts/maniskill"
 
