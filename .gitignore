@@ -152,3 +152,6 @@ informations/
 # Rollout videos and wandb logs
 rollouts/
 wandb/
+
+# etc
+.sisyphus/
