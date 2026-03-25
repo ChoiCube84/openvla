@@ -26,6 +26,11 @@ from experiments.robot.maniskill.artifacts import (
     write_manifest,
     write_summary,
 )
+from experiments.robot.maniskill.checkpoint_guard import (
+    CheckpointValidationError,
+    resolve_checkpoint_target,
+    validate_checkpoint_reference,
+)
 from experiments.robot.maniskill.defaults import (
     ARTIFACT_ROOT,
     ASSUMPTION_LEDGER_PATH_TEMPLATE,
@@ -80,6 +85,9 @@ class ManiSkillEvalConfig:
     seed: int = 7
 
 
+JUELG_MANISKILL_UNNORM_KEY = "maniskill_human:7.0.0"
+
+
 def _parse_task_ids(task_ids_csv: str) -> list[str]:
     requested = [task_id.strip() for task_id in task_ids_csv.split(",") if task_id.strip()]
     if not requested:
@@ -114,9 +122,10 @@ def _resolve_episode_count(cfg: ManiSkillEvalConfig) -> int:
 
 
 def _resolve_checkpoint(cfg: ManiSkillEvalConfig) -> str:
-    if str(cfg.pretrained_checkpoint).strip():
-        return str(cfg.pretrained_checkpoint)
-    return str(CHECKPOINT_POLICY["fallback_reference"])
+    return resolve_checkpoint_target(
+        checkpoint_override=str(cfg.pretrained_checkpoint),
+        fallback_reference=str(CHECKPOINT_POLICY["fallback_reference"]),
+    )
 
 
 def _resolve_maniskill_version() -> str:
@@ -186,11 +195,17 @@ def _resolve_task_unnorm_key(cfg: ManiSkillEvalConfig, model: Any, task_id: str)
                 f"INVALID_UNNORM_KEY: configured key `{selected}` missing for task `{task_id}`. available=[{available}]"
             )
 
+        if selected == JUELG_MANISKILL_UNNORM_KEY:
+            return selected
+
         if task_stem_lower not in selected.lower() and task_id_lower not in selected.lower():
             raise ValueError(
                 f"UNNORM_KEY_TASK_MISMATCH: configured key `{selected}` is not task-specific for `{task_id}`."
             )
         return selected
+
+    if JUELG_MANISKILL_UNNORM_KEY in norm_stats:
+        return JUELG_MANISKILL_UNNORM_KEY
 
     candidates: list[str] = []
     for base in (
@@ -240,6 +255,22 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
 
     cfg.pretrained_checkpoint = _resolve_checkpoint(cfg)
     set_seed_everywhere(cfg.seed)
+
+    try:
+        if cfg.model_family == "openvla":
+            checkpoint_validation = validate_checkpoint_reference(
+                str(cfg.pretrained_checkpoint),
+                source_type="auto",
+                require_dataset_statistics=True,
+            )
+            print(
+                "CHECKPOINT_VALID: "
+                f"source_type={checkpoint_validation.source_type} "
+                f"checkpoint_reference={checkpoint_validation.checkpoint_reference}"
+            )
+    except CheckpointValidationError as exc:
+        print(f"{exc.tag}: {exc.message}")
+        raise SystemExit(1)
 
     model = get_model(cfg)
     processor = get_processor(cfg) if cfg.model_family == "openvla" else None

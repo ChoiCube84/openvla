@@ -3,10 +3,14 @@
 import json
 import os
 import time
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import tensorflow as tf
 import torch
+from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError, RepositoryNotFoundError
 from PIL import Image
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
@@ -27,6 +31,86 @@ OPENVLA_V01_SYSTEM_PROMPT = (
     "The assistant gives helpful, detailed, and polite answers to the user's questions."
 )
 
+JUELG_MANISKILL_CHECKPOINT = "Juelg/openvla-7b-finetuned-maniskill"
+OPENVLA_BASE_CHECKPOINT = "openvla/openvla-7b"
+
+
+def _looks_like_local_checkpoint(path_or_id: str) -> bool:
+    if path_or_id.startswith(".") or path_or_id.startswith("~"):
+        return True
+    if Path(path_or_id).is_absolute():
+        return True
+    return path_or_id.count("/") != 1
+
+
+def validate_hf_checkpoint_contract(pretrained_checkpoint: str | os.PathLike[str]) -> dict[str, Any]:
+    checkpoint = str(pretrained_checkpoint).strip()
+    if not checkpoint:
+        raise ValueError("HF_CHECKPOINT_CONTRACT_INVALID: checkpoint reference is empty.")
+
+    checkpoint_path = Path(checkpoint).expanduser()
+    source = "hf_hub"
+    file_set: set[str]
+
+    if checkpoint_path.exists():
+        if not checkpoint_path.is_dir():
+            raise ValueError(
+                f"HF_CHECKPOINT_CONTRACT_INVALID: local checkpoint `{checkpoint_path}` exists but is not a directory."
+            )
+        source = "local"
+        file_set = {entry.name for entry in checkpoint_path.iterdir() if entry.is_file()}
+    else:
+        if _looks_like_local_checkpoint(checkpoint):
+            raise ValueError(
+                f"HF_CHECKPOINT_CONTRACT_INVALID: local checkpoint directory `{checkpoint}` does not exist."
+            )
+
+        api = HfApi()
+        try:
+            file_set = set(api.list_repo_files(repo_id=checkpoint, repo_type="model"))
+        except RepositoryNotFoundError as exc:
+            raise ValueError(
+                f"HF_CHECKPOINT_CONTRACT_INVALID: HF model repo `{checkpoint}` was not found."
+            ) from exc
+        except HfHubHTTPError as exc:
+            raise ValueError(
+                f"HF_CHECKPOINT_CONTRACT_INVALID: failed to inspect HF model repo `{checkpoint}` ({exc})."
+            ) from exc
+
+    required_exact = {"config.json"}
+    required_any_weights = {
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+    }
+    required_any_processor = {"preprocessor_config.json", "processor_config.json"}
+
+    missing_exact = sorted(required_exact - file_set)
+    has_weights = any(name in file_set for name in required_any_weights)
+    has_processor = any(name in file_set for name in required_any_processor)
+
+    errors: list[str] = []
+    if missing_exact:
+        errors.append(f"missing={missing_exact}")
+    if not has_weights:
+        errors.append(f"missing_any_weights={sorted(required_any_weights)}")
+    if not has_processor:
+        errors.append(f"missing_any_processor={sorted(required_any_processor)}")
+
+    if errors:
+        detail = "; ".join(errors)
+        raise ValueError(
+            "HF_CHECKPOINT_CONTRACT_INVALID: "
+            f"checkpoint `{checkpoint}` ({source}) does not satisfy minimal OpenVLA preflight contract ({detail})."
+        )
+
+    return {
+        "checkpoint": checkpoint,
+        "source": source,
+        "file_count": len(file_set),
+    }
+
 
 def get_vla(cfg):
     """Loads and returns a VLA model from checkpoint."""
@@ -40,15 +124,30 @@ def get_vla(cfg):
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
-    vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.pretrained_checkpoint,
-        attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16,
-        load_in_8bit=cfg.load_in_8bit,
-        load_in_4bit=cfg.load_in_4bit,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    )
+    checkpoint_reference = str(cfg.pretrained_checkpoint).strip()
+    model_weights_reference = checkpoint_reference
+    model_config = None
+
+    if checkpoint_reference == JUELG_MANISKILL_CHECKPOINT:
+        model_weights_reference = OPENVLA_BASE_CHECKPOINT
+        model_config = AutoConfig.from_pretrained(checkpoint_reference, trust_remote_code=True)
+        print(
+            "HF_CHECKPOINT_RUNTIME_SEMANTICS: "
+            f"using base weights `{model_weights_reference}` with config/statistics source `{checkpoint_reference}`."
+        )
+
+    model_load_kwargs: dict[str, Any] = {
+        "attn_implementation": "flash_attention_2",
+        "torch_dtype": torch.bfloat16,
+        "load_in_8bit": cfg.load_in_8bit,
+        "load_in_4bit": cfg.load_in_4bit,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": True,
+    }
+    if model_config is not None:
+        model_load_kwargs["config"] = model_config
+
+    vla = AutoModelForVision2Seq.from_pretrained(model_weights_reference, **model_load_kwargs)
 
     # Move model to device.
     # Note: `.to()` is not supported for 8-bit or 4-bit bitsandbytes models, but the model will
@@ -57,11 +156,32 @@ def get_vla(cfg):
         vla = vla.to(DEVICE)
 
     # Load dataset stats used during finetuning (for action un-normalization).
-    dataset_statistics_path = os.path.join(cfg.pretrained_checkpoint, "dataset_statistics.json")
+    dataset_statistics_source = checkpoint_reference
+    dataset_statistics_path = os.path.join(dataset_statistics_source, "dataset_statistics.json")
     if os.path.isfile(dataset_statistics_path):
         with open(dataset_statistics_path, "r") as f:
             norm_stats = json.load(f)
         vla.norm_stats = norm_stats
+    elif not _looks_like_local_checkpoint(dataset_statistics_source):
+        try:
+            stats_path = hf_hub_download(
+                repo_id=dataset_statistics_source,
+                filename="dataset_statistics.json",
+                repo_type="model",
+            )
+            with open(stats_path, "r") as f:
+                norm_stats = json.load(f)
+            vla.norm_stats = norm_stats
+        except EntryNotFoundError:
+            print(
+                "HF_CHECKPOINT_DATASET_STATS_MISSING: "
+                f"`dataset_statistics.json` is missing in `{dataset_statistics_source}`."
+            )
+        except Exception as exc:
+            print(
+                "HF_CHECKPOINT_DATASET_STATS_UNAVAILABLE: "
+                f"unable to load dataset statistics for `{dataset_statistics_source}` ({exc})."
+            )
     else:
         print(
             "WARNING: No local dataset_statistics.json file found for current checkpoint.\n"

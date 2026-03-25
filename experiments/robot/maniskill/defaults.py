@@ -21,7 +21,7 @@ SEED_POLICY = {
 CHECKPOINT_POLICY = {
     "selection": "user_provided_or_repo_default",
     "paper_identical_provenance_proven": False,
-    "fallback_reference": "openvla/openvla-7b",
+    "fallback_reference": "Juelg/openvla-7b-finetuned-maniskill",
 }
 
 SUMMARY_SCHEMA_KEYS = [

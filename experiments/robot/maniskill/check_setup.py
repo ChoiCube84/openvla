@@ -20,6 +20,11 @@ from experiments.robot.maniskill.defaults import (
     SEED_POLICY,
     TASK_IDS,
 )
+from experiments.robot.maniskill.checkpoint_guard import (
+    CheckpointValidationError,
+    resolve_checkpoint_target,
+    validate_checkpoint_reference,
+)
 
 
 CHECKPOINT_ENV_KEY = "OPENVLA_MANISKILL_CHECKPOINT"
@@ -32,50 +37,19 @@ def fail(tag: str, message: str, code: int = 1) -> NoReturn:
     raise SystemExit(code)
 
 
-def _is_reference_checkpoint(checkpoint_value: str) -> bool:
-    fallback_reference = str(CHECKPOINT_POLICY["fallback_reference"])
-    return checkpoint_value == fallback_reference
-
-
-def _resolve_checkpoint_target() -> str:
-    checkpoint_value = os.environ.get(CHECKPOINT_ENV_KEY, "").strip()
-    if checkpoint_value:
-        return checkpoint_value
-    return str(CHECKPOINT_POLICY["fallback_reference"])
-
-
-def _validate_checkpoint_layout(checkpoint_target: str) -> None:
-    checkpoint_path = Path(checkpoint_target)
-    if not checkpoint_path.exists():
-        if _is_reference_checkpoint(checkpoint_target):
-            return
-        fail("CHECKPOINT_MISSING", f"Path does not exist: `{checkpoint_path}`")
-
-    run_dir: Path
-    if checkpoint_path.is_file():
-        if checkpoint_path.suffix != ".pt" or checkpoint_path.parent.name != "checkpoints":
-            fail(
-                "CHECKPOINT_MISSING",
-                f"Expected a `.pt` file under a `checkpoints/` directory but got `{checkpoint_path}`.",
-            )
-        run_dir = checkpoint_path.parents[1]
-    elif checkpoint_path.is_dir():
-        run_dir = checkpoint_path
-        checkpoint_path = run_dir / "checkpoints" / "latest-checkpoint.pt"
-        if not checkpoint_path.exists():
-            fail(
-                "CHECKPOINT_MISSING",
-                f"Missing `checkpoints/latest-checkpoint.pt` under `{run_dir}`.",
-            )
-    else:
-        fail("CHECKPOINT_MISSING", f"Unsupported checkpoint path: `{checkpoint_path}`")
-
-    config_json = run_dir / "config.json"
-    dataset_statistics_json = run_dir / "dataset_statistics.json"
-    if not config_json.exists():
-        fail("CHECKPOINT_MISSING", f"Missing `config.json` for `{run_dir}`")
-    if not dataset_statistics_json.exists():
-        fail("CHECKPOINT_MISSING", f"Missing `dataset_statistics.json` for `{run_dir}`")
+def _validate_checkpoint_target() -> None:
+    checkpoint_target = resolve_checkpoint_target(
+        checkpoint_override=os.environ.get(CHECKPOINT_ENV_KEY, ""),
+        fallback_reference=str(CHECKPOINT_POLICY["fallback_reference"]),
+    )
+    try:
+        validate_checkpoint_reference(
+            checkpoint_target,
+            source_type="auto",
+            require_dataset_statistics=True,
+        )
+    except CheckpointValidationError as exc:
+        fail(exc.tag, exc.message)
 
 
 def _validate_gpu_policy() -> None:
@@ -188,8 +162,7 @@ def _validate_disk_budget() -> None:
 
 
 def main() -> None:
-    checkpoint_target = _resolve_checkpoint_target()
-    _validate_checkpoint_layout(checkpoint_target)
+    _validate_checkpoint_target()
     _validate_gpu_policy()
     _validate_maniskill_import()
     _validate_renderer_dependencies()

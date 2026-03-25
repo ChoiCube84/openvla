@@ -8,6 +8,31 @@ log() {
   printf '[openvla-maniskill] %s\n' "$*"
 }
 
+print_usage() {
+  cat <<'EOF'
+Usage: bash cluster/run_openvla_maniskill_benchmark.sh
+
+Runs ManiSkill benchmark flow (setup -> estimate -> smoke -> full -> rebake).
+
+Default checkpoint path (Juelg-first):
+  Juelg/openvla-7b-finetuned-maniskill
+
+Optional local override:
+  OPENVLA_MANISKILL_CHECKPOINT=/path/to/openvla-run-or-checkpoint
+
+Optional GPU/launcher environment variables:
+  OPENVLA_MANISKILL_GPU_INDEX
+  OPENVLA_MANISKILL_VISIBLE_DEVICES_OVERRIDE
+  OPENVLA_MANISKILL_CONDA_ENV
+  OPENVLA_MANISKILL_SKIP_CONDA_ACTIVATE=1
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  print_usage
+  exit 0
+fi
+
 choose_gpu_index() {
   python - <<'PY'
 import subprocess

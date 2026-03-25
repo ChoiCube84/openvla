@@ -22,12 +22,21 @@ MAX_JOBS=4 pip install "flash-attn==2.5.5" --no-build-isolation
 
 Use the same environment that runs `python experiments/robot/maniskill/run_maniskill_eval.py`.
 
-## 2) Checkpoint placement / path
+## 2) Checkpoint path model (Juelg-first)
 
-Default zero-arg launcher path uses the in-repo fallback checkpoint reference from
-`experiments/robot/maniskill/defaults.py` (`openvla/openvla-7b`).
+Default zero-arg launcher path uses the fallback reference from
+`experiments/robot/maniskill/defaults.py`:
 
-Optional override: set `OPENVLA_MANISKILL_CHECKPOINT` when you want a specific checkpoint.
+- `Juelg/openvla-7b-finetuned-maniskill`
+
+Runtime semantics for this default path are intentionally two-step:
+
+- base model weights from `openvla/openvla-7b`
+- processor/config and ManiSkill normalization stats from `Juelg/openvla-7b-finetuned-maniskill`
+
+`openvla/openvla-7b` alone is not a valid ManiSkill benchmark checkpoint for this workflow because it lacks required ManiSkill dataset statistics.
+
+Local checkpoint support remains available as an explicit override using `OPENVLA_MANISKILL_CHECKPOINT`.
 Accepted local override forms:
 
 - Run directory containing:
@@ -41,6 +50,11 @@ Override example:
 ```bash
 export OPENVLA_MANISKILL_CHECKPOINT="/path/to/openvla-run"
 ```
+
+HF cache/network behavior:
+
+- first run of the default Juelg path requires Hugging Face network access
+- later runs can reuse local HF cache when artifacts are already present
 
 ## 3) Launch benchmark (setup -> estimate -> smoke -> full -> exemplar rebake)
 

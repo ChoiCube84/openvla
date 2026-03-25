@@ -4,7 +4,7 @@ This repository is a cluster-focused fork of [`openvla/openvla`](https://github.
 
 Its current purpose is **not** to document the full upstream OpenVLA training/fine-tuning stack. Instead, it is organized around one practical goal:
 
-- run the **vanilla OpenVLA baseline** on **ManiSkill** from a GPU cluster
+- run the **Juelg-first OpenVLA ManiSkill benchmark path** from a GPU cluster
 - produce a benchmark score
 - save exemplar success/failure videos
 - keep raw frame artifacts so videos can be regenerated later
@@ -83,9 +83,16 @@ The default launcher path uses the fallback checkpoint reference defined in:
 
 Default value:
 
-- `openvla/openvla-7b`
+- `Juelg/openvla-7b-finetuned-maniskill`
 
-To use a local fine-tuned checkpoint instead, set:
+This ManiSkill workflow is intentionally **Juelg-first**. Runtime semantics for the default path are:
+
+- base model weights from `openvla/openvla-7b`
+- processor/config and ManiSkill normalization stats (`dataset_statistics.json`) from `Juelg/openvla-7b-finetuned-maniskill`
+
+Important: `openvla/openvla-7b` **alone** is not treated as a valid ManiSkill benchmark checkpoint for this workflow because it does not provide the required ManiSkill dataset statistics.
+
+To use a local checkpoint run directory or checkpoint file instead, set an explicit override:
 
 ```bash
 export OPENVLA_MANISKILL_CHECKPOINT="/path/to/checkpoint-or-run-dir"
@@ -94,6 +101,11 @@ export OPENVLA_MANISKILL_CHECKPOINT="/path/to/checkpoint-or-run-dir"
 Accepted local override forms are documented in:
 
 - `experiments/robot/maniskill/CLUSTER_BENCHMARK.md`
+
+## Hugging Face Network/Cache Assumptions
+
+For the default Juelg path, first run requires Hugging Face access to resolve model/config/statistics assets.
+After first successful download, subsequent runs can reuse the local HF cache.
 
 ## Outputs
 
