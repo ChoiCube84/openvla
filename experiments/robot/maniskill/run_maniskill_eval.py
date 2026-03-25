@@ -8,6 +8,7 @@ from typing import Any, Optional, Union
 
 import draccus
 import numpy as np
+import torch
 from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -385,7 +386,10 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
                         obs, _, terminated, truncated, info = env.step(env_action)
 
                         rendered_frame = env.render()
-                        rendered_frame = np.asarray(rendered_frame)
+                        if isinstance(rendered_frame, torch.Tensor):
+                            rendered_frame = rendered_frame.detach().cpu().numpy()
+                        else:
+                            rendered_frame = np.asarray(rendered_frame)
                         frame_path = frame_dir / f"frame_{frame_count:06d}.png"
                         _save_frame(rendered_frame, frame_path)
                         frame_paths.append(frame_path)
