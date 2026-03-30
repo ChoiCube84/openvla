@@ -1,115 +1,88 @@
 # OpenVLA ManiSkill Cluster Benchmark
 
-This repository is a cluster-focused fork of [`openvla/openvla`](https://github.com/openvla/openvla).
-
-Its current purpose is **not** to document the full upstream OpenVLA training/fine-tuning stack. Instead, it is organized around one practical goal:
-
-- run the **Juelg-first OpenVLA ManiSkill benchmark path** from a GPU cluster
-- produce a benchmark score
-- save exemplar success/failure videos
-- keep raw frame artifacts so videos can be regenerated later
+This repository is a cluster-focused fork of [`openvla/openvla`](https://github.com/openvla/openvla) centered on ManiSkill benchmark execution.
 
 ## Current Scope
 
-This fork currently supports a FailSafe-aligned baseline workflow for these 3 ManiSkill tasks:
+This fork supports three ManiSkill tasks:
 
 - `PickCube-v1`
 - `PushCube-v1`
 - `StackCube-v1`
 
-It does **not** implement the FailSafe dual-model recovery method yet.
+and three execution modes:
 
-## Target Cluster Assumptions
+- **dual-model compare-both (primary):** OpenVLA child + pi0 child + parent comparison summary
+- single-model OpenVLA (supporting/backward-compatible)
+- single-model pi0 (supporting)
 
-The workflow is designed for a Linux GPU cluster environment with:
+## Primary Entry Point (Dual-Model Compare)
 
-- Python 3.10
-- Conda environment named `openvla`
-- NVIDIA RTX A6000 GPUs (48 GB VRAM)
+Use this as the primary dual-model benchmark path:
 
-No server hostnames, usernames, mount paths, or private cluster details are required by the documented workflow.
+```bash
+bash cluster/run_dual_model_maniskill_benchmark.sh
+```
 
-## Main Entry Point
+The launcher runs two child evals sequentially (`openvla` then `pi0`) and writes one parent summary:
 
-The standard entry point is:
+- child 1: `python experiments/robot/maniskill/run_maniskill_eval.py --model_family openvla ...`
+- child 2: `python experiments/robot/maniskill/run_maniskill_eval.py --model_family pi0 ...`
+- parent: `rollouts/maniskill_comparisons/<compare_id>/comparison_summary.json`
+
+Single-model OpenVLA launcher remains available:
 
 ```bash
 bash cluster/run_openvla_maniskill_benchmark.sh
 ```
 
-This launcher performs, in order:
+## Runtime Environments and OpenPI Requirements
 
-1. setup preflight
-2. runtime estimation
-3. smoke benchmark
-4. full benchmark
-5. exemplar video rebake
+### OpenVLA child runtime
 
-The launcher is intentionally **zero-argument** for the default path.
+- Conda environment: `openvla`
+- Typical deps include ManiSkill/Gymnasium and OpenVLA runtime dependencies.
 
-GPU selection is launcher-level:
+### pi0 child runtime
 
-- if `OPENVLA_MANISKILL_VISIBLE_DEVICES_OVERRIDE` is set, the launcher uses that value directly
-- else if `OPENVLA_MANISKILL_GPU_INDEX` is set, the launcher uses that physical GPU index
-- else the launcher auto-selects the least-used GPU reported by `nvidia-smi`
+The pi0 backend requires OpenPI runtime assumptions that are separate from OpenVLA:
 
-## Installation on the Cluster
+- `OPENPI_CONDA_ENV=openpi` (launcher variable: `OPENVLA_MANISKILL_OPENPI_CONDA_ENV`)
+- `OPENPI_REPO_ROOT=/path/to/openpi` (launcher variable: `OPENVLA_MANISKILL_OPENPI_REPO_ROOT`)
+- policy server endpoint (launcher variable: `OPENVLA_MANISKILL_PI0_POLICY_SERVER_URL`, default runner value `http://127.0.0.1:8000`)
+- default pi0 checkpoint target: `gs://openpi-assets/checkpoints/pi05_libero`
 
-From the repository root:
+One explicit startup example for the supported `pi05_libero` policy-server path:
 
 ```bash
-pip install -e .
-pip install -r experiments/robot/libero/libero_requirements.txt
-pip install mani_skill gymnasium imageio imageio-ffmpeg draccus
-pip install packaging ninja psutil
-ninja --version
-pip install "flash-attn==2.5.5" --no-build-isolation
+export OPENPI_REPO_ROOT="/path/to/openpi"
+export OPENPI_CONDA_ENV="openpi"
+cd "${OPENPI_REPO_ROOT}"
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "${OPENPI_CONDA_ENV}"
+uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --policy.dir=gs://openpi-assets/checkpoints/pi05_libero
 ```
 
-If `flash-attn` fails on the first try, a common retry is:
+The current dual launcher forwards OpenPI settings into the pi0 child run. It does **not** claim full automatic OpenPI server lifecycle orchestration; ensure the policy server endpoint you pass is reachable.
 
-```bash
-pip cache remove flash_attn
-MAX_JOBS=4 pip install "flash-attn==2.5.5" --no-build-isolation
-```
+## OpenVLA Checkpoint Behavior
 
-If your cluster requires a specific PyTorch/CUDA installation path, install the correct Torch build in the `openvla` environment first.
+For OpenVLA runs, default fallback checkpoint behavior remains Juelg-first (`Juelg/openvla-7b-finetuned-maniskill`) with ManiSkill statistics requirements, and local overrides remain supported via explicit checkpoint env/args.
 
-## Default Checkpoint Behavior
+## Artifacts
 
-The default launcher path uses the fallback checkpoint reference defined in:
+### Dual-model compare artifacts
 
-- `experiments/robot/maniskill/defaults.py`
+Outputs are grouped under:
 
-Default value:
+- `rollouts/maniskill_comparisons/<compare_id>/`
+  - `openvla/` (child run tree: `summary.json`, `manifest.json`, `episodes.jsonl`, `frames/`, `videos/`)
+  - `pi0/` (child run tree: `summary.json`, `manifest.json`, `episodes.jsonl`, `frames/`, `videos/`)
+  - `openvla_child.log`
+  - `pi0_child.log`
+  - `comparison_summary.json` (parent compare summary)
 
-- `Juelg/openvla-7b-finetuned-maniskill`
-
-This ManiSkill workflow is intentionally **Juelg-first**. Runtime semantics for the default path are:
-
-- base model weights from `openvla/openvla-7b`
-- processor/config and ManiSkill normalization stats (`dataset_statistics.json`) from `Juelg/openvla-7b-finetuned-maniskill`
-
-Important: `openvla/openvla-7b` **alone** is not treated as a valid ManiSkill benchmark checkpoint for this workflow because it does not provide the required ManiSkill dataset statistics.
-
-To use a local checkpoint run directory or checkpoint file instead, set an explicit override:
-
-```bash
-export OPENVLA_MANISKILL_CHECKPOINT="/path/to/checkpoint-or-run-dir"
-```
-
-Accepted local override forms are documented in:
-
-- `experiments/robot/maniskill/CLUSTER_BENCHMARK.md`
-
-## Hugging Face Network/Cache Assumptions
-
-For the default Juelg path, first run requires Hugging Face access to resolve model/config/statistics assets.
-After first successful download, subsequent runs can reuse the local HF cache.
-
-## Outputs
-
-The workflow writes outputs under:
+### Single-model artifacts
 
 - `rollouts/maniskill/runtime_estimate.json`
 - `rollouts/maniskill/<run_id>/summary.json`
@@ -118,110 +91,63 @@ The workflow writes outputs under:
 - `rollouts/maniskill/<run_id>/frames/`
 - `rollouts/maniskill/<run_id>/videos/`
 
-Videos are generated from saved frames after the benchmark run. Existing MP4s are preserved unless rebake is called with `--overwrite`.
+## Runtime Estimate Guidance (Honest Compare Semantics)
 
-## Runtime Estimate
+`experiments/robot/maniskill/estimate_runtime.py` currently emits a **single-child** estimate at:
 
-The current estimator output in this repository reports:
+- `rollouts/maniskill/runtime_estimate.json`
 
-- **Smoke run:** about **5.8 seconds**
-- **Full run:** about **78.9 seconds**
-- **Estimated raw artifact storage:** about **8.26 GB** for the default full run
+There is no dedicated compare-mode estimator file yet. For dual-model compare runs, practical wall-clock should be treated as:
 
-Practical total wall-clock expectation for the zero-arg launcher is:
+- OpenVLA child runtime
+- plus pi0 child runtime
+- plus parent orchestration overhead (child process launch, log parse, parent summary write)
 
-- **about 2 to 5 minutes** on a properly configured cluster node for the currently configured default benchmark size
-
-Why this is larger than the raw 78.9-second full estimate:
-
-- Python startup/import overhead
-- setup checks
-- runtime probe pass
-- smoke run before full run
-- log parsing and artifact bookkeeping
-- exemplar video rebake after the full run
-
-Important caveat:
-
-- this estimate is based on the current implemented probe method and current benchmark defaults
-- actual cluster runtime can vary with model-loading overhead, filesystem speed, GPU contention, and ManiSkill rendering performance
-- if you change episode counts, seeds, frame retention, or checkpoint behavior, total runtime will change too
-
-For the latest machine-readable estimate, run:
-
-```bash
-python experiments/robot/maniskill/estimate_runtime.py
-```
+Actual runtime still varies with model load time, filesystem speed, GPU contention, rendering throughput, and policy-server responsiveness.
 
 ## Useful Commands
 
-Setup only:
+Dual launcher help:
+
+```bash
+bash cluster/run_dual_model_maniskill_benchmark.sh --help
+```
+
+Single-model setup check:
 
 ```bash
 python experiments/robot/maniskill/check_setup.py
 ```
 
-Runtime estimate only:
+Single-model runtime estimate:
 
 ```bash
 python experiments/robot/maniskill/estimate_runtime.py
 ```
 
-Smoke benchmark only:
+Single-model OpenVLA eval:
 
 ```bash
-python experiments/robot/maniskill/run_maniskill_eval.py --mode smoke
+python experiments/robot/maniskill/run_maniskill_eval.py --model_family openvla --mode full
 ```
 
-Full benchmark only:
+Single-model pi0 eval example:
 
 ```bash
-python experiments/robot/maniskill/run_maniskill_eval.py --mode full
-```
-
-Rebake exemplar videos:
-
-```bash
-python experiments/robot/maniskill/rebake_videos.py --run_dir rollouts/maniskill/<run_id>
-```
-
-Force overwrite during rebake:
-
-```bash
-python experiments/robot/maniskill/rebake_videos.py --run_dir rollouts/maniskill/<run_id> --overwrite
-```
-
-QA-only launcher failure path for GPU visibility:
-
-```bash
-OPENVLA_MANISKILL_VISIBLE_DEVICES_OVERRIDE='' bash cluster/run_openvla_maniskill_benchmark.sh
-```
-
-Pick a specific physical GPU yourself:
-
-```bash
-OPENVLA_MANISKILL_GPU_INDEX=1 bash cluster/run_openvla_maniskill_benchmark.sh
+python experiments/robot/maniskill/run_maniskill_eval.py --model_family pi0 --mode full --openpi_conda_env openpi --openpi_repo_root /path/to/openpi
 ```
 
 ## File Guide
 
-- `cluster/run_openvla_maniskill_benchmark.sh` — zero-arg cluster launcher
-- `experiments/robot/maniskill/defaults.py` — benchmark defaults and assumptions
-- `experiments/robot/maniskill/check_setup.py` — preflight validation
-- `experiments/robot/maniskill/estimate_runtime.py` — runtime/storage estimation
-- `experiments/robot/maniskill/run_maniskill_eval.py` — ManiSkill benchmark runner
-- `experiments/robot/maniskill/artifacts.py` — output layout and metadata helpers
-- `experiments/robot/maniskill/rebake_videos.py` — video regeneration from saved frames
-- `experiments/robot/maniskill/CLUSTER_BENCHMARK.md` — concise operational notes
-
-## Repository Hygiene
-
-Local paper PDFs and cluster notes under `informations/` are intentionally ignored by git and should not be pushed.
+- `cluster/run_dual_model_maniskill_benchmark.sh` — dual-model compare launcher
+- `cluster/run_openvla_maniskill_benchmark.sh` — single-model OpenVLA launcher
+- `experiments/robot/maniskill/run_maniskill_eval.py` — ManiSkill child runner (`openvla` or `pi0`)
+- `experiments/robot/maniskill/estimate_runtime.py` — single-child runtime/storage estimation
+- `experiments/robot/maniskill/artifacts.py` — child/parent artifact layout helpers
+- `experiments/robot/maniskill/CLUSTER_BENCHMARK.md` — operational cluster notes
 
 ## Upstream Reference
 
-If you need the original OpenVLA training, fine-tuning, or broader project documentation, refer to the upstream repository:
+For broader OpenVLA training/fine-tuning docs, refer to upstream:
 
 - https://github.com/openvla/openvla
-
-This fork is intentionally narrower and currently centered on **cluster execution of the ManiSkill baseline benchmark**.

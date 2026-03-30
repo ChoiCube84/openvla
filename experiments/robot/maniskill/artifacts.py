@@ -16,8 +16,16 @@ from experiments.robot.maniskill.defaults import (
 EPISODES_JSONL = "episodes.jsonl"
 SUMMARY_JSON = "summary.json"
 MANIFEST_JSON = "manifest.json"
+COMPARISON_SUMMARY_JSON = "comparison_summary.json"
 FRAMES_DIR = "frames"
 VIDEOS_DIR = "videos"
+COMPARISON_ARTIFACT_ROOT = "rollouts/maniskill_comparisons"
+COMPARE_SUMMARY_SCHEMA_KEYS = [
+    "compare_id",
+    "comparison_status",
+    "children",
+    "artifact_paths",
+]
 
 
 def _to_path(path_like: str | Path) -> Path:
@@ -57,6 +65,13 @@ def _require_summary_keys(summary_payload: Mapping[str, Any]) -> None:
     if missing:
         missing_keys = ", ".join(missing)
         raise ValueError(f"Summary payload missing required keys: {missing_keys}")
+
+
+def _require_compare_summary_keys(summary_payload: Mapping[str, Any]) -> None:
+    missing = [key for key in COMPARE_SUMMARY_SCHEMA_KEYS if key not in summary_payload]
+    if missing:
+        missing_keys = ", ".join(missing)
+        raise ValueError(f"Comparison summary payload missing required keys: {missing_keys}")
 
 
 def _ensure_parent(path: Path) -> None:
@@ -104,6 +119,26 @@ def build_artifact_paths(run_dir: str | Path) -> Dict[str, str]:
         "episodes": str(resolved_run_dir / EPISODES_JSONL),
         "frames": str(resolved_run_dir / FRAMES_DIR),
         "videos": str(resolved_run_dir / VIDEOS_DIR),
+    }
+
+
+def create_comparison_layout(
+    compare_id: str,
+    artifact_root: str | Path = COMPARISON_ARTIFACT_ROOT,
+) -> Path:
+    compare_dir = _to_path(artifact_root) / compare_id
+    (compare_dir / "openvla").mkdir(parents=True, exist_ok=True)
+    (compare_dir / "pi0").mkdir(parents=True, exist_ok=True)
+    return compare_dir
+
+
+def build_comparison_artifact_paths(compare_dir: str | Path) -> Dict[str, str]:
+    resolved_compare_dir = _to_path(compare_dir)
+    return {
+        "compare_dir": str(resolved_compare_dir),
+        "comparison_summary": str(resolved_compare_dir / COMPARISON_SUMMARY_JSON),
+        "openvla_root": str(resolved_compare_dir / "openvla"),
+        "pi0_root": str(resolved_compare_dir / "pi0"),
     }
 
 
@@ -155,6 +190,18 @@ def write_manifest(run_dir: str | Path, manifest_payload: Mapping[str, Any]) -> 
     manifest_path = _to_path(run_dir) / MANIFEST_JSON
     _write_json(manifest_path, manifest)
     return manifest_path
+
+
+def write_comparison_summary(compare_dir: str | Path, summary_payload: Mapping[str, Any]) -> Path:
+    _require_compare_summary_keys(summary_payload)
+    summary = dict(summary_payload)
+    artifact_paths = dict(summary.get("artifact_paths", {}))
+    artifact_paths.update(build_comparison_artifact_paths(compare_dir))
+    summary["artifact_paths"] = artifact_paths
+
+    summary_path = _to_path(compare_dir) / COMPARISON_SUMMARY_JSON
+    _write_json(summary_path, summary)
+    return summary_path
 
 
 def build_episode_metadata(

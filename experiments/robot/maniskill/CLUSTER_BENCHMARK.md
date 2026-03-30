@@ -1,111 +1,115 @@
-# OpenVLA ManiSkill Cluster Benchmark (Zero-Arg Launcher)
+# OpenVLA ManiSkill Cluster Benchmark
 
-## 1) Dependencies (cluster node)
+## 1) Primary workflow: dual-model compare-both
 
-From repo root:
-
-```bash
-pip install -e .
-pip install -r experiments/robot/libero/libero_requirements.txt
-pip install mani_skill gymnasium imageio imageio-ffmpeg draccus
-pip install packaging ninja psutil
-ninja --version
-pip install "flash-attn==2.5.5" --no-build-isolation
-```
-
-Retry pattern if `flash-attn` build fails:
+Primary launcher:
 
 ```bash
-pip cache remove flash_attn
-MAX_JOBS=4 pip install "flash-attn==2.5.5" --no-build-isolation
+bash cluster/run_dual_model_maniskill_benchmark.sh
 ```
 
-Use the same environment that runs `python experiments/robot/maniskill/run_maniskill_eval.py`.
+What it does:
 
-## 2) Checkpoint path model (Juelg-first)
+- runs OpenVLA child eval first
+- runs pi0 child eval second
+- writes one parent `comparison_summary.json`
 
-Default zero-arg launcher path uses the fallback reference from
-`experiments/robot/maniskill/defaults.py`:
+Each child uses `experiments/robot/maniskill/run_maniskill_eval.py` with a model-specific `--artifact_root` under the same compare directory.
 
-- `Juelg/openvla-7b-finetuned-maniskill`
+Single-model launchers/runs remain available as supporting modes, but compare-both is the main dual-model path.
 
-Runtime semantics for this default path are intentionally two-step:
+## 2) Runtime assumptions by model family
 
-- base model weights from `openvla/openvla-7b`
-- processor/config and ManiSkill normalization stats from `Juelg/openvla-7b-finetuned-maniskill`
+### OpenVLA child
 
-`openvla/openvla-7b` alone is not a valid ManiSkill benchmark checkpoint for this workflow because it lacks required ManiSkill dataset statistics.
+- expected runtime env: `openvla`
+- follows existing OpenVLA checkpoint behavior (Juelg-first fallback unless overridden)
 
-Local checkpoint support remains available as an explicit override using `OPENVLA_MANISKILL_CHECKPOINT`.
-Accepted local override forms:
+### pi0 child
 
-- Run directory containing:
-  - `config.json`
-  - `dataset_statistics.json`
-  - `checkpoints/latest-checkpoint.pt`
-- Or an explicit `.pt` file under a `checkpoints/` directory.
+pi0 has separate runtime requirements and is not just an OpenVLA-mode switch.
 
-Override example:
+Required/expected settings:
+
+- `OPENPI_CONDA_ENV=openpi` (forwarded via `OPENVLA_MANISKILL_OPENPI_CONDA_ENV`)
+- `OPENPI_REPO_ROOT=/path/to/openpi` (forwarded via `OPENVLA_MANISKILL_OPENPI_REPO_ROOT`)
+- policy server endpoint (forwarded via `OPENVLA_MANISKILL_PI0_POLICY_SERVER_URL`; runner default is `http://127.0.0.1:8000`)
+- default pi0 checkpoint target is `gs://openpi-assets/checkpoints/pi05_libero`
+
+Explicit OpenPI policy-server startup example for the supported `pi05_libero` target:
 
 ```bash
-export OPENVLA_MANISKILL_CHECKPOINT="/path/to/openvla-run"
+export OPENPI_REPO_ROOT="/path/to/openpi"
+export OPENPI_CONDA_ENV="openpi"
+cd "${OPENPI_REPO_ROOT}"
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "${OPENPI_CONDA_ENV}"
+uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --policy.dir=gs://openpi-assets/checkpoints/pi05_libero
 ```
 
-HF cache/network behavior:
+Important honesty note: the dual launcher forwards settings to the pi0 child, but does not claim full automatic OpenPI server lifecycle management. Ensure the policy-server endpoint is reachable before launch.
 
-- first run of the default Juelg path requires Hugging Face network access
-- later runs can reuse local HF cache when artifacts are already present
+## 3) Dual-launcher environment variables
 
-## 3) Launch benchmark (setup -> estimate -> smoke -> full -> exemplar rebake)
+```text
+OPENVLA_MANISKILL_COMPARE_ID
+OPENVLA_MANISKILL_COMPARE_ARTIFACT_ROOT (default: rollouts/maniskill_comparisons)
+OPENVLA_MANISKILL_COMPARE_MODE (default: full)
+OPENVLA_MANISKILL_TASK_IDS
+OPENVLA_MANISKILL_EPISODES_PER_TASK
+OPENVLA_MANISKILL_MAX_STEPS_PER_EPISODE
+OPENVLA_MANISKILL_OPENVLA_CHECKPOINT
+OPENVLA_MANISKILL_PI0_CHECKPOINT
+OPENVLA_MANISKILL_PI0_POLICY_SERVER_URL
+OPENVLA_MANISKILL_OPENPI_CONDA_ENV
+OPENVLA_MANISKILL_OPENPI_REPO_ROOT
+OPENVLA_MANISKILL_EVAL_ENTRYPOINT
+```
+
+Show launcher help:
+
+```bash
+bash cluster/run_dual_model_maniskill_benchmark.sh --help
+```
+
+## 4) Artifact layout (compare mode)
+
+Dual-model compare artifacts are kept together under one compare root:
+
+- `rollouts/maniskill_comparisons/<compare_id>/`
+  - `openvla/` child artifacts
+  - `pi0/` child artifacts
+  - `openvla_child.log`
+  - `pi0_child.log`
+  - `comparison_summary.json`
+
+Each child artifact tree keeps the normal runner outputs (`summary.json`, `manifest.json`, `episodes.jsonl`, `frames/`, `videos/`).
+
+## 5) Runtime estimate guidance
+
+Current machine-readable estimate file remains single-child:
+
+- `rollouts/maniskill/runtime_estimate.json`
+
+There is no dedicated compare estimate generator yet. For compare mode, treat wall-clock as:
+
+- OpenVLA child runtime
+- plus pi0 child runtime
+- plus orchestration overhead (sequential launch + child log parse + parent summary write)
+
+Do not assume compare runtime equals one child run.
+
+## 6) Supporting single-model commands
+
+OpenVLA single-model launcher (backward compatibility):
 
 ```bash
 bash cluster/run_openvla_maniskill_benchmark.sh
 ```
 
-Default GPU mapping is launcher-level.
-
-Optional env controls:
-
-- `OPENVLA_MANISKILL_CONDA_ENV` (default: `openvla`)
-- `OPENVLA_MANISKILL_SKIP_CONDA_ACTIVATE=1` (skip `conda activate`)
-- `OPENVLA_MANISKILL_GPU_INDEX` (pick a specific physical GPU index)
-- `OPENVLA_MANISKILL_VISIBLE_DEVICES_OVERRIDE` (QA-only override of `CUDA_VISIBLE_DEVICES`)
-
-Default behavior:
-
-- if `OPENVLA_MANISKILL_VISIBLE_DEVICES_OVERRIDE` is set, the launcher uses it directly
-- else if `OPENVLA_MANISKILL_GPU_INDEX` is set, the launcher uses that physical GPU index
-- else the launcher auto-selects the least-used GPU from `nvidia-smi`
-
-Choose a specific GPU explicitly:
+Direct single-model child eval examples:
 
 ```bash
-OPENVLA_MANISKILL_GPU_INDEX=1 bash cluster/run_openvla_maniskill_benchmark.sh
-```
-
-QA failure-path check (forces setup failure before benchmark execution):
-
-```bash
-OPENVLA_MANISKILL_VISIBLE_DEVICES_OVERRIDE='' bash cluster/run_openvla_maniskill_benchmark.sh
-```
-
-## 4) Outputs
-
-- Runtime estimate: `rollouts/maniskill/runtime_estimate.json`
-- Full run artifacts: `rollouts/maniskill/<run_id>/`
-  - `summary.json`
-  - `manifest.json`
-  - `episodes.jsonl`
-  - `frames/`
-  - `videos/`
-
-Default zero-arg launcher flow now runs `rebake_videos.py` after the full benchmark and writes exemplar MP4s into
-`rollouts/maniskill/<run_id>/videos/`; existing MP4s are preserved unless `--overwrite` is explicitly enabled.
-
-Launcher prints `run_dir`, `summary_path`, and `average_success_rate` at completion.
-
-## 5) Rebake exemplar videos from saved frames
-
-```bash
-python experiments/robot/maniskill/rebake_videos.py --run_dir rollouts/maniskill/<run_id> [--overwrite]
+python experiments/robot/maniskill/run_maniskill_eval.py --model_family openvla --mode full
+python experiments/robot/maniskill/run_maniskill_eval.py --model_family pi0 --mode full --openpi_conda_env openpi --openpi_repo_root /path/to/openpi
 ```

@@ -1,13 +1,72 @@
 {
-  "active_plan": "/home/user1/openvla/.sisyphus/plans/use-juelg-maniskill-checkpoint.md",
-  "started_at": "2026-03-25T00:23:47.967Z",
+  "active_plan": "/home/user1/openvla/.sisyphus/plans/dual-model-maniskill-benchmark.md",
+  "started_at": "2026-03-30T09:47:38.735Z",
   "session_ids": [
     "ses_2e47eff93ffeh2CVn4Wcj6gFhd",
-    "ses_2dd9e8133ffeMg2V2OUTKKA3aO",
-    "ses_2dd9e8135ffe2hxBRyM57PzJw7",
-    "ses_2dd9aded1ffeYv8miq7cAnayAA",
-    "ses_2dd943e45ffeJ0O2tvrA94WA8O"
+    "ses_2c1d9c1fcffelykeDszcxZcxIE",
+    "ses_2c1d6cde2ffeKwCN30NjjDcbFy",
+    "ses_2c1ca117efferpz7Lgxt1x92vY",
+    "ses_2c1c8f6fcffelBiYe46OIBOmJf",
+    "ses_2c1c14cf2ffeH6hej1u5uOXYK2",
+    "ses_2c1bf2e59ffeN2jk2T3KGxa6p1",
+    "ses_2c1afc033ffeIpaHEZZjcQY0d3",
+    "ses_2c1ae9ab6ffeLInpWJoueH7F2L",
+    "ses_2c1a6d726ffeL2Aio30YtEeBT7",
+    "ses_2c1a5fabfffebLeSvj2v7d1WuM",
+    "ses_2c1a4f005ffemDnnbRjEFyaRrI",
+    "ses_2c1a4f007ffelI1j3JftEPz5Sy",
+    "ses_2c19fd388ffet4En77XbuE3nxU",
+    "ses_2c19fde7bffenEvuiPLI4rDuH2",
+    "ses_2c19fd367ffe85QtVQ6klnzsbR",
+    "ses_2c19fd386ffeEgoDV4UHdZgQGZ"
   ],
-  "plan_name": "use-juelg-maniskill-checkpoint",
-  "agent": "atlas"
+  "plan_name": "dual-model-maniskill-benchmark",
+  "agent": "atlas",
+  "task_sessions": {
+    "todo:1": {
+      "task_key": "todo:1",
+      "task_label": "1",
+      "task_title": "Introduce a ManiSkill-local backend adapter contract and migrate OpenVLA into it",
+      "session_id": "ses_2c1d6cde2ffeKwCN30NjjDcbFy",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-03-30T09:59:41.785Z"
+    },
+    "todo:2": {
+      "task_key": "todo:2",
+      "task_label": "2",
+      "task_title": "Add pi_0 backend via separate OpenPI policy-server runtime",
+      "session_id": "ses_2c1c8f6fcffelBiYe46OIBOmJf",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-03-30T10:13:28.029Z"
+    },
+    "todo:3": {
+      "task_key": "todo:3",
+      "task_label": "3",
+      "task_title": "Add compare-both orchestrator and parent comparison summary",
+      "session_id": "ses_2c1bf2e59ffeN2jk2T3KGxa6p1",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-03-30T10:25:34.697Z"
+    },
+    "todo:4": {
+      "task_key": "todo:4",
+      "task_label": "4",
+      "task_title": "Update setup/runtime estimation and docs for the dual-model workflow",
+      "session_id": "ses_2c1ae9ab6ffeLInpWJoueH7F2L",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-low",
+      "updated_at": "2026-03-30T10:41:35.783Z"
+    },
+    "final-wave:f1": {
+      "task_key": "final-wave:f1",
+      "task_label": "F1",
+      "task_title": "Plan Compliance Audit — oracle",
+      "session_id": "ses_2c19fde7bffenEvuiPLI4rDuH2",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-low",
+      "updated_at": "2026-03-30T10:55:12.357Z"
+    }
+  }
 }

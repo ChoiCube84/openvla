@@ -32,6 +32,7 @@ from experiments.robot.maniskill.checkpoint_guard import (
     resolve_checkpoint_target,
     validate_checkpoint_reference,
 )
+from experiments.robot.maniskill.backends import get_backend
 from experiments.robot.maniskill.defaults import (
     ARTIFACT_ROOT,
     ASSUMPTION_LEDGER_PATH_TEMPLATE,
@@ -49,12 +50,13 @@ from experiments.robot.maniskill.maniskill_utils import (
     extract_image_observation,
     interpret_step_outcome,
 )
-from experiments.robot.openvla_utils import get_processor
 from experiments.robot.robot_utils import (
     DATE_TIME,
     get_action,
+    get_backend_info,
     get_image_resize_size,
     get_model,
+    get_processor,
     invert_gripper_action,
     normalize_gripper_action,
     set_seed_everywhere,
@@ -79,6 +81,11 @@ class ManiSkillEvalConfig:
     save_videos: bool = False
 
     unnorm_key: str = ""
+
+    pi0_policy_server_url: str = "http://127.0.0.1:8000"
+    openpi_conda_env: str = "openpi"
+    openpi_repo_root: str = ""
+    openpi_checkpoint: Union[str, Path] = "gs://openpi-assets/checkpoints/pi05_libero"
 
     run_id_note: Optional[str] = None
     local_log_dir: str = "./experiments/logs"
@@ -123,6 +130,8 @@ def _resolve_episode_count(cfg: ManiSkillEvalConfig) -> int:
 
 
 def _resolve_checkpoint(cfg: ManiSkillEvalConfig) -> str:
+    if cfg.model_family == "pi0":
+        return str(cfg.openpi_checkpoint)
     return resolve_checkpoint_target(
         checkpoint_override=str(cfg.pretrained_checkpoint),
         fallback_reference=str(CHECKPOINT_POLICY["fallback_reference"]),
@@ -258,6 +267,13 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
     set_seed_everywhere(cfg.seed)
 
     try:
+        backend_info = get_backend_info(cfg)
+        backend = get_backend(cfg.model_family)
+    except ValueError as exc:
+        print(str(exc))
+        raise SystemExit(1)
+
+    try:
         if cfg.model_family == "openvla":
             checkpoint_validation = validate_checkpoint_reference(
                 str(cfg.pretrained_checkpoint),
@@ -274,7 +290,7 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
         raise SystemExit(1)
 
     model = get_model(cfg)
-    processor = get_processor(cfg) if cfg.model_family == "openvla" else None
+    processor = get_processor(cfg)
     resize_size = get_image_resize_size(cfg)
 
     run_id = f"EVAL-maniskill-{cfg.mode}-{cfg.model_family}-{DATE_TIME}"
@@ -319,6 +335,7 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
         log_file.flush()
 
         for task_id in selected_task_ids:
+            backend.reset_rollout_state(task_label=task_id, reason="task_reset")
             task_unnorm_key = _resolve_task_unnorm_key(cfg, model, task_id)
             cfg.unnorm_key = task_unnorm_key
             env = create_maniskill_env(
@@ -352,6 +369,7 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
                 for episode_index in range(episodes_per_task):
                     start_time = time.perf_counter()
                     episode_seed = cfg.seed + episode_index
+                    backend.reset_rollout_state(task_label=task_id, reason="episode_reset")
                     obs, _ = env.reset(seed=episode_seed)
                     frame_dir = get_frame_dir(
                         run_dir,
@@ -454,6 +472,7 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
 
         manifest_payload = {
             "run_id": run_id,
+            "backend": backend_info,
             "tasks": selected_task_ids,
             "mode": cfg.mode,
             "config": asdict(cfg),
@@ -466,6 +485,7 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
 
         summary_payload = {
             "tasks": selected_task_ids,
+            "backend": backend_info,
             "per_task_success_rate": per_task_success_rate,
             "average_success_rate": average_success_rate,
             "checkpoint": str(cfg.pretrained_checkpoint),
@@ -497,4 +517,5 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
 
 
 if __name__ == "__main__":
-    eval_maniskill()
+    entrypoint: Any = eval_maniskill
+    entrypoint()

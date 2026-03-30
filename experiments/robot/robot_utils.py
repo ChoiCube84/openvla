@@ -7,10 +7,7 @@ import time
 import numpy as np
 import torch
 
-from experiments.robot.openvla_utils import (
-    get_vla,
-    get_vla_action,
-)
+from experiments.robot.maniskill.backends import get_backend, get_backend_metadata
 
 # Initialize important constants and pretty-printing mode in NumPy.
 ACTION_DIM = 7
@@ -39,12 +36,20 @@ def set_seed_everywhere(seed: int):
 
 def get_model(cfg, wrap_diffusion_policy_for_droid=False):
     """Load model for evaluation."""
-    if cfg.model_family == "openvla":
-        model = get_vla(cfg)
-    else:
-        raise ValueError("Unexpected `model_family` found in config.")
+    backend = get_backend(cfg.model_family)
+    model = backend.get_model(cfg)
     print(f"Loaded model: {type(model)}")
     return model
+
+
+def get_processor(cfg):
+    backend = get_backend(cfg.model_family)
+    return backend.get_processor(cfg)
+
+
+def get_backend_info(cfg):
+    metadata = get_backend_metadata(cfg.model_family)
+    return metadata.to_dict()
 
 
 def get_image_resize_size(cfg):
@@ -53,22 +58,15 @@ def get_image_resize_size(cfg):
     If `resize_size` is an int, then the resized image will be a square.
     Else, the image will be a rectangle.
     """
-    if cfg.model_family == "openvla":
-        resize_size = 224
-    else:
-        raise ValueError("Unexpected `model_family` found in config.")
-    return resize_size
+    backend = get_backend(cfg.model_family)
+    return backend.get_image_resize_size(cfg)
 
 
 def get_action(cfg, model, obs, task_label, processor=None):
     """Queries the model to get an action."""
-    if cfg.model_family == "openvla":
-        action = get_vla_action(
-            model, processor, cfg.pretrained_checkpoint, obs, task_label, cfg.unnorm_key, center_crop=cfg.center_crop
-        )
-        assert action.shape == (ACTION_DIM,)
-    else:
-        raise ValueError("Unexpected `model_family` found in config.")
+    backend = get_backend(cfg.model_family)
+    action = backend.get_action(cfg, model, obs, task_label, processor=processor)
+    assert action.shape == (ACTION_DIM,)
     return action
 
 
