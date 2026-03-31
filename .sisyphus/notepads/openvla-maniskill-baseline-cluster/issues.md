@@ -1,5 +1,0 @@
-
-- Verification environment lacks `torch` and ManiSkill stack (`mani_skill`, `gymnasium`), so local `check_setup.py` success-path (`SETUP_OK`) could not be executed end-to-end here; failure-path checks and estimator fallback path were verified.
-- Task 4 verification in this environment is blocked at import time because `draccus` is missing (`ModuleNotFoundError: No module named 'draccus'`), so required smoke command execution could not reach runtime benchmark logic.
-- LSP diagnostics on new ManiSkill files report dependency-resolution errors for unavailable packages in this environment (`draccus`, `numpy`, `PIL`, `mani_skill`, `gymnasium`, `torch`), so import-resolution clean checks require the benchmark runtime environment.
-- Task 6 launcher QA checks could only verify preflight-failure behavior here: both default and `OPENVLA_MANISKILL_VISIBLE_DEVICES_OVERRIDE=''` invocations fail at `check_setup.py` with `GPU_POLICY_UNAVAILABLE` because `torch` is missing, so setup->estimate->smoke->full success-path execution still requires a provisioned cluster env.
