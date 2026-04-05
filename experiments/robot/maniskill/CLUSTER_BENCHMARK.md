@@ -1,8 +1,8 @@
 # OpenVLA ManiSkill Cluster Benchmark
 
-## 1) Primary workflow: dual-model compare-both
+## 1) Benchmark architecture
 
-Primary launcher:
+Primary compare launcher:
 
 ```bash
 bash cluster/run_dual_model_maniskill_benchmark.sh
@@ -17,6 +17,14 @@ What it does:
 Each child uses `experiments/robot/maniskill/run_maniskill_eval.py` with a model-specific `--artifact_root` under the same compare directory.
 
 Single-model launchers/runs remain available as supporting modes, but compare-both is the main dual-model path.
+
+The cleaned architecture also includes a diagnostics matrix launcher:
+
+```bash
+bash cluster/run_benchmark_diagnostics_matrix.sh
+```
+
+The diagnostics matrix is not the same thing as a compare run. It is the structured path for move limit diagnostics, cross-suite evidence collection, and explicit matrix summaries.
 
 ## 2) Runtime assumptions by model family
 
@@ -35,6 +43,13 @@ Required/expected settings:
 - `OPENPI_REPO_ROOT=/path/to/openpi` (forwarded via `OPENVLA_MANISKILL_OPENPI_REPO_ROOT`)
 - policy server endpoint (forwarded via `OPENVLA_MANISKILL_PI0_POLICY_SERVER_URL`; runner default is `http://127.0.0.1:8000`)
 - default pi0 checkpoint target is `gs://openpi-assets/checkpoints/pi05_libero`
+
+Managed bootstrap/cache note:
+
+- when an explicit OpenPI checkout is not provided, launcher-driven pi0 paths use a managed cache
+- the managed cache location is `${XDG_CACHE_HOME:-$HOME/.cache}/openvla/openpi`
+- the same cache expectation applies to diagnostics matrix pi0 cells
+- cache preparation validates the checkout; it does not replace the need for a reachable policy server
 
 Explicit OpenPI policy-server startup example for the supported `pi05_libero` target:
 
@@ -72,6 +87,34 @@ Show launcher help:
 bash cluster/run_dual_model_maniskill_benchmark.sh --help
 ```
 
+Diagnostics matrix launcher:
+
+```bash
+bash cluster/run_benchmark_diagnostics_matrix.sh
+```
+
+Key diagnostics matrix environment variables:
+
+```text
+OPENVLA_DIAGNOSTICS_PLAN_ONLY=1
+OPENVLA_DIAGNOSTICS_SUMMARY_PATH
+OPENVLA_DIAGNOSTICS_RAISED_HORIZON
+OPENVLA_DIAGNOSTICS_OPENVLA_REPO_DEFAULT_CHECKPOINT
+OPENVLA_DIAGNOSTICS_OPENVLA_FINETUNED_CHECKPOINT
+OPENVLA_DIAGNOSTICS_PI0_CHECKPOINT
+OPENVLA_DIAGNOSTICS_LIBERO_TASK_SUITE
+OPENVLA_DIAGNOSTICS_LIBERO_NUM_TRIALS
+```
+
+- `OPENVLA_DIAGNOSTICS_PLAN_ONLY=1` writes the diagnostics matrix plan/summary without launching cells.
+- `OPENVLA_DIAGNOSTICS_SUMMARY_PATH` changes where the diagnostics matrix summary is written.
+- `OPENVLA_DIAGNOSTICS_RAISED_HORIZON` controls the raised ManiSkill move limit used in the horizon comparison.
+- `OPENVLA_DIAGNOSTICS_OPENVLA_REPO_DEFAULT_CHECKPOINT` controls the checkpoint used by diagnostics matrix OpenVLA reference cells (default: `openvla/openvla-7b`).
+- `OPENVLA_DIAGNOSTICS_OPENVLA_FINETUNED_CHECKPOINT` controls the checkpoint used by diagnostics matrix OpenVLA finetuned cells (default: `Juelg/openvla-7b-finetuned-maniskill`).
+- `OPENVLA_DIAGNOSTICS_PI0_CHECKPOINT` controls the pi0/OpenPI checkpoint used by diagnostics matrix pi0 cells.
+- `OPENVLA_DIAGNOSTICS_LIBERO_TASK_SUITE` controls which LIBERO task suite the diagnostics matrix uses.
+- `OPENVLA_DIAGNOSTICS_LIBERO_NUM_TRIALS` controls how many trials per LIBERO task the diagnostics matrix runs.
+
 ## 4) Artifact layout (compare mode)
 
 Dual-model compare artifacts are kept together under one compare root:
@@ -99,7 +142,18 @@ There is no dedicated compare estimate generator yet. For compare mode, treat wa
 
 Do not assume compare runtime equals one child run.
 
-## 6) Supporting single-model commands
+For the diagnostics matrix, do not assume the matrix summary is a single-child estimate. Diagnostics matrix runtime is the sum of launched cells, move limit comparison pairs, and summary-writing overhead.
+
+## 6) Diagnostics matrix and move limit diagnostics
+
+The diagnostics matrix keeps one-factor comparisons explicit.
+
+- ManiSkill move limit diagnostics compare baseline vs raised `max_steps_per_episode`
+- the diagnostics matrix writes a machine-readable summary at `rollouts/diagnostics/experiment_matrix_summary.json`
+- `cluster/run_benchmark_diagnostics_matrix.sh` is the launcher to use when you want those diagnostics matrix artifacts
+- LIBERO and ManiSkill evidence live in the same diagnostics matrix workflow so cross-suite checks are discoverable from one summary
+
+## 7) Supporting single-model commands
 
 OpenVLA single-model launcher (backward compatibility):
 

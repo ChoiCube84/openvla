@@ -507,10 +507,12 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
         print(f"summary_path={summary_path}")
         print(f"manifest_path={artifact_paths['manifest']}")
         print(f"episodes_path={artifact_paths['episodes']}")
+        print(f"run_dir={run_dir}")
         log_file.write(f"average_success_rate={average_success_rate:.4f}\n")
         log_file.write(f"summary_path={summary_path}\n")
         log_file.write(f"manifest_path={artifact_paths['manifest']}\n")
         log_file.write(f"episodes_path={artifact_paths['episodes']}\n")
+        log_file.write(f"run_dir={run_dir}\n")
         log_file.flush()
     finally:
         log_file.close()

@@ -20,6 +20,8 @@ Runs the compare-both dual-model workflow by default:
 Outputs (default root):
   rollouts/maniskill_comparisons/<compare_id>/openvla/
   rollouts/maniskill_comparisons/<compare_id>/pi0/
+  rollouts/maniskill_comparisons/<compare_id>/openvla_child.log
+  rollouts/maniskill_comparisons/<compare_id>/pi0_child.log
   rollouts/maniskill_comparisons/<compare_id>/comparison_summary.json
 
 OpenVLA and pi0 runtime assumptions are separate. pi0 expects OpenPI settings
@@ -54,6 +56,7 @@ COMPARE_ID="${OPENVLA_MANISKILL_COMPARE_ID:-COMPARE-maniskill-$(date +%Y%m%d-%H%
 COMPARE_ARTIFACT_ROOT="${OPENVLA_MANISKILL_COMPARE_ARTIFACT_ROOT:-rollouts/maniskill_comparisons}"
 COMPARE_DIR="${COMPARE_ARTIFACT_ROOT}/${COMPARE_ID}"
 EVAL_ENTRYPOINT="${OPENVLA_MANISKILL_EVAL_ENTRYPOINT:-experiments/robot/maniskill/run_maniskill_eval.py}"
+OPENPI_BOOTSTRAP_HELPER="${REPO_ROOT}/experiments/robot/maniskill/bootstrap_openpi.py"
 
 python - "${COMPARE_ID}" "${COMPARE_ARTIFACT_ROOT}" <<'PY'
 import sys
@@ -94,15 +97,6 @@ PI0_ARGS=(
 if [[ -n "${OPENVLA_MANISKILL_PI0_CHECKPOINT:-}" ]]; then
   PI0_ARGS+=(--openpi_checkpoint "${OPENVLA_MANISKILL_PI0_CHECKPOINT}")
 fi
-if [[ -n "${OPENVLA_MANISKILL_PI0_POLICY_SERVER_URL:-}" ]]; then
-  PI0_ARGS+=(--pi0_policy_server_url "${OPENVLA_MANISKILL_PI0_POLICY_SERVER_URL}")
-fi
-if [[ -n "${OPENVLA_MANISKILL_OPENPI_CONDA_ENV:-}" ]]; then
-  PI0_ARGS+=(--openpi_conda_env "${OPENVLA_MANISKILL_OPENPI_CONDA_ENV}")
-fi
-if [[ -n "${OPENVLA_MANISKILL_OPENPI_REPO_ROOT:-}" ]]; then
-  PI0_ARGS+=(--openpi_repo_root "${OPENVLA_MANISKILL_OPENPI_REPO_ROOT}")
-fi
 
 log "Running child model=openvla mode=${COMPARE_MODE}"
 set +e
@@ -111,11 +105,39 @@ OPENVLA_EXIT_CODE=$?
 set -e
 log "openvla exit_code=${OPENVLA_EXIT_CODE} log_path=${OPENVLA_LOG_PATH}"
 
-log "Running child model=pi0 mode=${COMPARE_MODE}"
+PI0_RUNTIME_ENV_PATH="$(mktemp -t openpi-runtime.XXXXXX.env)"
+trap 'rm -f "${PI0_RUNTIME_ENV_PATH}"' EXIT
+PI0_RUNTIME_ARGS=(
+  --emit-env-file "${PI0_RUNTIME_ENV_PATH}"
+  --checkpoint "${OPENVLA_MANISKILL_PI0_CHECKPOINT:-}"
+  --policy-server-url "${OPENVLA_MANISKILL_PI0_POLICY_SERVER_URL:-}"
+  --openpi-conda-env "${OPENVLA_MANISKILL_OPENPI_CONDA_ENV:-}"
+  --require-policy-server-health
+)
+if [[ -n "${OPENVLA_MANISKILL_OPENPI_REPO_ROOT:-}" ]]; then
+  PI0_RUNTIME_ARGS+=(--openpi-repo-root "${OPENVLA_MANISKILL_OPENPI_REPO_ROOT}")
+fi
+
+log "Preparing pi0 runtime mode=${COMPARE_MODE}"
 set +e
-python "${EVAL_ENTRYPOINT}" "${COMMON_ARGS[@]}" "${PI0_ARGS[@]}" >"${PI0_LOG_PATH}" 2>&1
-PI0_EXIT_CODE=$?
+python "${OPENPI_BOOTSTRAP_HELPER}" "${PI0_RUNTIME_ARGS[@]}" >"${PI0_LOG_PATH}" 2>&1
+PI0_RUNTIME_EXIT_CODE=$?
 set -e
+if [[ ${PI0_RUNTIME_EXIT_CODE} -ne 0 ]]; then
+  PI0_EXIT_CODE=${PI0_RUNTIME_EXIT_CODE}
+  log "pi0 runtime prep failed exit_code=${PI0_EXIT_CODE} log_path=${PI0_LOG_PATH}"
+else
+  source "${PI0_RUNTIME_ENV_PATH}"
+  PI0_ARGS+=(--pi0_policy_server_url "${OPENPI_POLICY_SERVER_URL}")
+  PI0_ARGS+=(--openpi_conda_env "${OPENPI_CONDA_ENV}")
+  PI0_ARGS+=(--openpi_repo_root "${OPENPI_REPO_ROOT}")
+  log "pi0 runtime prep complete cache_state=${OPENPI_BOOTSTRAP_CACHE_STATE} repo_root=${OPENPI_REPO_ROOT}"
+  log "Running child model=pi0 mode=${COMPARE_MODE}"
+  set +e
+  python "${EVAL_ENTRYPOINT}" "${COMMON_ARGS[@]}" "${PI0_ARGS[@]}" >>"${PI0_LOG_PATH}" 2>&1
+  PI0_EXIT_CODE=$?
+  set -e
+fi
 log "pi0 exit_code=${PI0_EXIT_CODE} log_path=${PI0_LOG_PATH}"
 
 SUMMARY_PATH="$(python - \
