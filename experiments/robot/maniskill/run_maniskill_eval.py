@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -8,8 +9,6 @@ from typing import Any, Optional, Union
 
 import draccus
 import numpy as np
-import torch
-from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -32,6 +31,7 @@ from experiments.robot.maniskill.checkpoint_guard import (
     resolve_checkpoint_target,
     validate_checkpoint_reference,
 )
+from experiments.robot.interactive_workflow_contract import prompt_for_workflow_request
 from experiments.robot.maniskill.backends import get_backend
 from experiments.robot.maniskill.defaults import (
     ARTIFACT_ROOT,
@@ -50,17 +50,8 @@ from experiments.robot.maniskill.maniskill_utils import (
     extract_image_observation,
     interpret_step_outcome,
 )
-from experiments.robot.robot_utils import (
-    DATE_TIME,
-    get_action,
-    get_backend_info,
-    get_image_resize_size,
-    get_model,
-    get_processor,
-    invert_gripper_action,
-    normalize_gripper_action,
-    set_seed_everywhere,
-)
+
+DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 
 
 @dataclass
@@ -94,6 +85,7 @@ class ManiSkillEvalConfig:
 
 
 JUELG_MANISKILL_UNNORM_KEY = "maniskill_human:7.0.0"
+DIRECT_MANISKILL_WORKLOAD_KEYS = ("openvla_maniskill_ft", "openpi_maniskill")
 
 
 def _parse_task_ids(task_ids_csv: str) -> list[str]:
@@ -140,7 +132,7 @@ def _resolve_checkpoint(cfg: ManiSkillEvalConfig) -> str:
 
 def _resolve_maniskill_version() -> str:
     try:
-        import mani_skill
+        import mani_skill  # pyright: ignore[reportMissingImports]
 
         return str(getattr(mani_skill, "__version__", "unknown"))
     except Exception:
@@ -158,12 +150,16 @@ def _write_assumption_ledger(run_id: str, run_dir: Path, assumptions: list[dict[
 
 
 def _resize_for_model(image: np.ndarray, resize_size: int) -> np.ndarray:
+    from PIL import Image  # pyright: ignore[reportMissingImports]
+
     pil_image = Image.fromarray(image).convert("RGB")
     resized = pil_image.resize((resize_size, resize_size))
     return np.asarray(resized)
 
 
 def _save_frame(frame: np.ndarray, output_path: Path) -> None:
+    from PIL import Image  # pyright: ignore[reportMissingImports]
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     frame = np.asarray(frame)
     if frame.ndim == 4:
@@ -181,6 +177,60 @@ def _save_frame(frame: np.ndarray, output_path: Path) -> None:
     else:
         frame = np.clip(frame, 0, 255).astype(np.uint8)
     Image.fromarray(frame).convert("RGB").save(output_path)
+
+
+def _set_seed_everywhere(seed: int) -> None:
+    np.random.seed(seed)
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    try:
+        import torch  # pyright: ignore[reportMissingImports]
+
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
+
+
+def _get_backend_info(cfg: ManiSkillEvalConfig) -> dict[str, Any]:
+    return get_backend(cfg.model_family).metadata.to_dict()
+
+
+def _get_model(cfg: ManiSkillEvalConfig) -> Any:
+    return get_backend(cfg.model_family).get_model(cfg)
+
+
+def _get_processor(cfg: ManiSkillEvalConfig) -> Any:
+    return get_backend(cfg.model_family).get_processor(cfg)
+
+
+def _get_image_resize_size(cfg: ManiSkillEvalConfig) -> int:
+    return int(get_backend(cfg.model_family).get_image_resize_size(cfg))
+
+
+def _get_action(
+    cfg: ManiSkillEvalConfig,
+    model: Any,
+    obs: dict[str, Any],
+    task_label: str,
+    *,
+    processor: Any = None,
+) -> np.ndarray:
+    return get_backend(cfg.model_family).get_action(cfg, model, obs, task_label, processor=processor)
+
+
+def _normalize_gripper_action(action: np.ndarray, *, binarize: bool = True) -> np.ndarray:
+    action[..., -1] = 2 * (action[..., -1] - 0.0) / (1.0 - 0.0) - 1
+    if binarize:
+        action[..., -1] = np.sign(action[..., -1])
+    return action
+
+
+def _invert_gripper_action(action: np.ndarray) -> np.ndarray:
+    action[..., -1] = action[..., -1] * -1.0
+    return action
 
 
 def _resolve_task_unnorm_key(cfg: ManiSkillEvalConfig, model: Any, task_id: str) -> str:
@@ -248,8 +298,77 @@ def _resolve_task_unnorm_key(cfg: ManiSkillEvalConfig, model: Any, task_id: str)
     )
 
 
-@draccus.wrap()
-def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
+def _build_direct_prompt_config(workflow_request: dict[str, Any]) -> ManiSkillEvalConfig:
+    if bool(workflow_request.get("cancelled")):
+        reason = str(workflow_request.get("cancellation_reason", "USER_CANCELLED"))
+        raise ValueError(reason)
+
+    selection = str(workflow_request.get("selection", "")).strip()
+    if selection not in DIRECT_MANISKILL_WORKLOAD_KEYS:
+        supported = ", ".join(DIRECT_MANISKILL_WORKLOAD_KEYS)
+        raise ValueError(f"UNSUPPORTED_DIRECT_WORKLOAD: {selection or '<blank>'}. Supported values: {supported}")
+
+    workload_details = workflow_request.get("workload_details", {})
+    if not isinstance(workload_details, dict) or selection not in workload_details:
+        raise ValueError(f"INVALID_WORKFLOW_REQUEST: missing workload details for `{selection}`.")
+
+    workload_detail = workload_details[selection]
+    if not isinstance(workload_detail, dict):
+        raise ValueError(f"INVALID_WORKFLOW_REQUEST: workload detail for `{selection}` must be an object.")
+    if str(workload_detail.get("benchmark", "")).strip() != "maniskill":
+        raise ValueError(f"UNSUPPORTED_DIRECT_WORKLOAD: `{selection}` is not a ManiSkill workload.")
+
+    model_family = str(workload_detail.get("model_family", "")).strip()
+    if model_family not in {"openvla", "pi0"}:
+        raise ValueError(f"INVALID_WORKFLOW_REQUEST: unsupported ManiSkill model family `{model_family}`.")
+
+    checkpoint_map = workflow_request.get("checkpoint_map", {})
+    checkpoint = str(checkpoint_map.get(selection, "")).strip() if isinstance(checkpoint_map, dict) else ""
+    if not checkpoint:
+        raise ValueError(f"INVALID_WORKFLOW_REQUEST: missing checkpoint mapping for `{selection}`.")
+
+    mode = str(workflow_request.get("maniskill_mode", "")).strip()
+    if not mode:
+        raise ValueError("INVALID_WORKFLOW_REQUEST: missing ManiSkill mode.")
+
+    raw_episodes_per_task = workflow_request.get("maniskill_episodes_per_task")
+    raw_episodes_text = str(raw_episodes_per_task).strip() if raw_episodes_per_task is not None else ""
+    if not raw_episodes_text:
+        raise ValueError("INVALID_WORKFLOW_REQUEST: missing ManiSkill episode count.")
+    try:
+        episodes_per_task = int(raw_episodes_text)
+    except ValueError as exc:
+        raise ValueError("INVALID_WORKFLOW_REQUEST: missing ManiSkill episode count.") from exc
+    artifact_root = str(workflow_request.get("artifact_root", ARTIFACT_ROOT)).strip() or ARTIFACT_ROOT
+
+    cfg = ManiSkillEvalConfig(
+        model_family=model_family,
+        mode=mode,
+        episodes_per_task=episodes_per_task,
+        artifact_root=artifact_root,
+    )
+    if model_family == "pi0":
+        cfg.openpi_checkpoint = checkpoint
+    else:
+        cfg.pretrained_checkpoint = checkpoint
+    return cfg
+
+
+def _run_direct_prompt_entrypoint() -> None:
+    try:
+        workflow_request = prompt_for_workflow_request(
+            supported_workload_keys=DIRECT_MANISKILL_WORKLOAD_KEYS,
+            default_artifact_root=ARTIFACT_ROOT,
+        )
+        cfg = _build_direct_prompt_config(workflow_request)
+    except ValueError as exc:
+        print(str(exc))
+        raise SystemExit(1) from exc
+
+    _eval_maniskill_impl(cfg)
+
+
+def _eval_maniskill_impl(cfg: ManiSkillEvalConfig) -> None:
     try:
         selected_task_ids = _parse_task_ids(cfg.task_ids)
         episodes_per_task = _resolve_episode_count(cfg)
@@ -264,10 +383,10 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
         raise ValueError("INVALID_QUANTIZATION: cannot enable both load_in_8bit and load_in_4bit.")
 
     cfg.pretrained_checkpoint = _resolve_checkpoint(cfg)
-    set_seed_everywhere(cfg.seed)
+    _set_seed_everywhere(cfg.seed)
 
     try:
-        backend_info = get_backend_info(cfg)
+        backend_info = _get_backend_info(cfg)
         backend = get_backend(cfg.model_family)
     except ValueError as exc:
         print(str(exc))
@@ -289,9 +408,9 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
         print(f"{exc.tag}: {exc.message}")
         raise SystemExit(1)
 
-    model = get_model(cfg)
-    processor = get_processor(cfg)
-    resize_size = get_image_resize_size(cfg)
+    model = _get_model(cfg)
+    processor = _get_processor(cfg)
+    resize_size = _get_image_resize_size(cfg)
 
     run_id = f"EVAL-maniskill-{cfg.mode}-{cfg.model_family}-{DATE_TIME}"
     if cfg.run_id_note:
@@ -395,18 +514,23 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
 
                         model_image = _resize_for_model(image, resize_size=resize_size)
                         observation = {"full_image": model_image}
-                        action = get_action(cfg, model, observation, task_id, processor=processor)
-                        action = normalize_gripper_action(action, binarize=True)
+                        action = _get_action(cfg, model, observation, task_id, processor=processor)
+                        action = _normalize_gripper_action(action, binarize=True)
                         if cfg.model_family == "openvla":
-                            action = invert_gripper_action(action)
+                            action = _invert_gripper_action(action)
 
                         env_action = adapt_action_for_maniskill(action, action_space)
                         obs, _, terminated, truncated, info = env.step(env_action)
 
                         rendered_frame = env.render()
-                        if isinstance(rendered_frame, torch.Tensor):
-                            rendered_frame = rendered_frame.detach().cpu().numpy()
-                        else:
+                        try:
+                            import torch  # pyright: ignore[reportMissingImports]
+
+                            if isinstance(rendered_frame, torch.Tensor):
+                                rendered_frame = rendered_frame.detach().cpu().numpy()
+                            else:
+                                rendered_frame = np.asarray(rendered_frame)
+                        except Exception:
                             rendered_frame = np.asarray(rendered_frame)
                         frame_path = frame_dir / f"frame_{frame_count:06d}.png"
                         _save_frame(rendered_frame, frame_path)
@@ -518,6 +642,14 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
         log_file.close()
 
 
+@draccus.wrap()
+def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
+    _eval_maniskill_impl(cfg)
+
+
 if __name__ == "__main__":
-    entrypoint: Any = eval_maniskill
-    entrypoint()
+    if len(sys.argv) == 1:
+        _run_direct_prompt_entrypoint()
+    else:
+        entrypoint: Any = eval_maniskill
+        entrypoint()

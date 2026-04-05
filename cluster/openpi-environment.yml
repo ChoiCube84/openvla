@@ -1,0 +1,38 @@
+name: openpi
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip>=24
+  - git
+  - git-lfs
+  - cmake
+  - ninja
+  - setuptools>=69
+  - wheel
+  - numpy>=1.26
+  - pillow
+  - requests
+  - pyyaml
+  - tqdm
+  - grpcio
+  - protobuf
+  - absl-py
+  - psutil
+  - uvicorn
+  - fastapi
+  - pytorch>=2.2
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - pip:
+      - sentencepiece
+      - transformers>=4.40
+      - tokenizers
+      - einops
+      - timm
+      - imageio
+      - opencv-python-headless
+      - json-numpy

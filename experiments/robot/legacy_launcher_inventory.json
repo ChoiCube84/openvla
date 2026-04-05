@@ -1,0 +1,16 @@
+{
+  "inventory_version": 2,
+  "canonical_shell_entrypoint": "cluster/run_cluster_workflow.sh",
+  "cleanup_order": [
+    "introduce",
+    "validate",
+    "remove"
+  ],
+  "retirement_status": "complete",
+  "removed_launcher_count": 3,
+  "retired_surface_summary": "The integrated cluster workflow wrapper is now the only supported shell entrypoint for operators.",
+  "known_historical_reference_roots": [
+    ".sisyphus",
+    "rollouts"
+  ]
+}

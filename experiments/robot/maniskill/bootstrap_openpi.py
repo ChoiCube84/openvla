@@ -58,6 +58,9 @@ class RuntimeMetadata:
     git_revision: str
     policy_server_status: str
     policy_server_url: str
+    policy_server_python: str
+    policy_server_entrypoint: str
+    policy_server_launch_prefix: str
     checkpoint: str
     openpi_conda_env: str
 
@@ -240,7 +243,7 @@ def _bootstrap_managed_repo(repo_root: Path, *, bootstrap_source_url: str, boots
         )
         try:
             os.replace(staging_repo_root, repo_root)
-        except FileExistsError as exc:
+        except (FileExistsError, OSError) as exc:
             raise OpenPIRuntimeError(
                 "cache_stale",
                 f"OPENPI_CACHE_STALE: managed cache path `{repo_root}` appeared during bootstrap; rerun after inspection.",
@@ -313,8 +316,24 @@ def _emit_env_file(path: Path, metadata: RuntimeMetadata) -> None:
         f"export OPENPI_BOOTSTRAP_REF={shlex.quote(metadata.bootstrap_ref)}",
         f"export OPENPI_BOOTSTRAP_GIT_REVISION={shlex.quote(metadata.git_revision)}",
         f"export OPENPI_POLICY_SERVER_STATUS={shlex.quote(metadata.policy_server_status)}",
+        f"export OPENPI_POLICY_SERVER_PYTHON={shlex.quote(metadata.policy_server_python)}",
+        f"export OPENPI_POLICY_SERVER_ENTRYPOINT={shlex.quote(metadata.policy_server_entrypoint)}",
+        f"export OPENPI_POLICY_SERVER_LAUNCH_PREFIX={shlex.quote(metadata.policy_server_launch_prefix)}",
     ]
     path.write_text("\n".join(lines) + "\n")
+
+
+def _policy_server_python() -> str:
+    return "python3"
+
+
+def _policy_server_entrypoint(repo_root: Path) -> Path:
+    return (repo_root / "scripts" / "serve_policy.py").resolve()
+
+
+def _policy_server_launch_prefix(repo_root: Path) -> str:
+    command = [_policy_server_python(), str(_policy_server_entrypoint(repo_root))]
+    return shlex.join(command)
 
 
 def _build_metadata(args: argparse.Namespace) -> RuntimeMetadata:
@@ -351,15 +370,17 @@ def _build_metadata(args: argparse.Namespace) -> RuntimeMetadata:
             bootstrap_action = "cache_reused"
             marker_path = repo_root / BOOTSTRAP_MARKER_NAME
         except OpenPIRuntimeError as exc:
-            if exc.state != "cache_missing":
+            if exc.state not in {"cache_missing", "cache_invalid", "cache_stale"}:
                 raise
+            if exc.state in {"cache_invalid", "cache_stale"} and repo_root.exists():
+                shutil.rmtree(repo_root, ignore_errors=True)
             marker, git_revision = _bootstrap_managed_repo(
                 repo_root,
                 bootstrap_source_url=bootstrap_source_url,
                 bootstrap_ref=bootstrap_ref,
             )
-            cache_state = "cache_missing_bootstrapped"
-            bootstrap_action = "cache_bootstrapped"
+            cache_state = f"{exc.state}_bootstrapped"
+            bootstrap_action = "cache_rebootstrapped" if exc.state != "cache_missing" else "cache_bootstrapped"
             marker_path = _write_marker(repo_root, marker)
 
     policy_server_status = "skipped"
@@ -384,6 +405,9 @@ def _build_metadata(args: argparse.Namespace) -> RuntimeMetadata:
         git_revision=git_revision,
         policy_server_status=policy_server_status,
         policy_server_url=policy_server_url,
+        policy_server_python=_policy_server_python(),
+        policy_server_entrypoint=str(_policy_server_entrypoint(repo_root)),
+        policy_server_launch_prefix=_policy_server_launch_prefix(repo_root),
         checkpoint=checkpoint,
         openpi_conda_env=openpi_conda_env,
     )
@@ -401,6 +425,9 @@ def _print_metadata(metadata: RuntimeMetadata) -> None:
     print(f"openpi_bootstrap_git_revision={metadata.git_revision}")
     print(f"openpi_policy_server_status={metadata.policy_server_status}")
     print(f"openpi_policy_server_url={metadata.policy_server_url}")
+    print(f"openpi_policy_server_python={metadata.policy_server_python}")
+    print(f"openpi_policy_server_entrypoint={metadata.policy_server_entrypoint}")
+    print(f"openpi_policy_server_launch_prefix={metadata.policy_server_launch_prefix}")
     print(f"openpi_checkpoint={metadata.checkpoint}")
     print(f"openpi_conda_env={metadata.openpi_conda_env}")
 

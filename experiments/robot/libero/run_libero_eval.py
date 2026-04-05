@@ -17,6 +17,8 @@ Usage:
         --wandb_entity <ENTITY>
 """
 
+# pyright: reportMissingImports=false
+
 import json
 import os
 import sys
@@ -28,19 +30,12 @@ from typing import Any, Optional, Union
 import draccus
 import numpy as np
 import tqdm
-from libero.libero import benchmark
 
-import wandb
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
 
-# Append current directory so that interpreter can find experiments.robot
-sys.path.append("../..")
-from experiments.robot.libero.libero_utils import (
-    get_libero_dummy_action,
-    get_libero_env,
-    get_libero_image,
-    quat2axisangle,
-    save_rollout_video,
-)
+from experiments.robot.interactive_workflow_contract import prompt_for_workflow_request
 from experiments.robot.maniskill.artifacts import (
     append_episode_record,
     build_artifact_paths,
@@ -50,15 +45,12 @@ from experiments.robot.maniskill.artifacts import (
     get_video_path,
     write_manifest,
 )
-from experiments.robot.openvla_utils import get_processor
-from experiments.robot.robot_utils import (
-    DATE_TIME,
-    get_action,
-    get_image_resize_size,
-    get_model,
-    invert_gripper_action,
-    normalize_gripper_action,
-    set_seed_everywhere,
+
+
+DIRECT_LIBERO_WORKLOAD_KEYS = (
+    "openvla_libero",
+    "openvla_libero_ft",
+    "openpi_libero",
 )
 
 
@@ -92,6 +84,7 @@ class GenerateConfig:
     #################################################################################################################
     # Utils
     #################################################################################################################
+    unnorm_key: str = ""
     run_id_note: Optional[str] = None                # Extra note to add in run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
     artifact_root: str = "rollouts/libero"          # Artifact root for machine-readable outputs
@@ -105,8 +98,28 @@ class GenerateConfig:
     # fmt: on
 
 
-@draccus.wrap()
-def eval_libero(cfg: GenerateConfig) -> None:
+def _eval_libero_impl(cfg: GenerateConfig) -> None:
+    import wandb
+    from libero.libero import benchmark
+
+    from experiments.robot.libero.libero_utils import (
+        get_libero_dummy_action,
+        get_libero_env,
+        get_libero_image,
+        quat2axisangle,
+        save_rollout_video,
+    )
+    from experiments.robot.openvla_utils import get_processor
+    from experiments.robot.robot_utils import (
+        DATE_TIME,
+        get_action,
+        get_image_resize_size,
+        get_model,
+        invert_gripper_action,
+        normalize_gripper_action,
+        set_seed_everywhere,
+    )
+
     assert cfg.pretrained_checkpoint is not None, "cfg.pretrained_checkpoint must not be None!"
     if "image_aug" in str(cfg.pretrained_checkpoint):
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
@@ -361,5 +374,71 @@ def eval_libero(cfg: GenerateConfig) -> None:
         log_file.close()
 
 
+@draccus.wrap()
+def eval_libero(cfg: GenerateConfig) -> None:
+    _eval_libero_impl(cfg)
+
+
+def _resolve_direct_artifact_root(workflow_request: dict[str, Any], workload_key: str) -> str:
+    if bool(workflow_request.get("artifact_root_overridden")):
+        return str(workflow_request["artifact_root"])
+
+    workload_details = workflow_request.get("workload_details", {})
+    default_root = workload_details.get(workload_key, {}).get("artifact_root", "")
+    return str(default_root or GenerateConfig.artifact_root)
+
+
+def _build_direct_eval_config(workflow_request: dict[str, Any]) -> GenerateConfig:
+    resolved_workloads = list(workflow_request.get("resolved_workloads", []))
+    if len(resolved_workloads) != 1:
+        raise ValueError(
+            f"INVALID_DIRECT_LIBERO_SELECTION: expected exactly one LIBERO workload, got {resolved_workloads}."
+        )
+
+    workload_key = resolved_workloads[0]
+    if workload_key not in DIRECT_LIBERO_WORKLOAD_KEYS:
+        supported = ", ".join(DIRECT_LIBERO_WORKLOAD_KEYS)
+        raise ValueError(
+            f"UNSUPPORTED_DIRECT_LIBERO_WORKLOAD: {workload_key}. Supported workloads: {supported}"
+        )
+
+    workload_details = workflow_request["workload_details"][workload_key]
+    return GenerateConfig(
+        model_family=str(workload_details["model_family"]),
+        pretrained_checkpoint=str(workflow_request["checkpoint_map"][workload_key]),
+        task_suite_name=str(workflow_request["libero_task_suite_name"]),
+        num_trials_per_task=int(workflow_request["libero_num_trials_per_task"]),
+        artifact_root=_resolve_direct_artifact_root(workflow_request, workload_key),
+    )
+
+
+def _run_interactive_libero_eval() -> int:
+    try:
+        workflow_request = prompt_for_workflow_request(
+            supported_workload_keys=DIRECT_LIBERO_WORKLOAD_KEYS,
+            default_artifact_root=GenerateConfig.artifact_root,
+        )
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+
+    if bool(workflow_request.get("cancelled")):
+        print(f"status={workflow_request['status']}")
+        print(f"cancellation_reason={workflow_request['cancellation_reason']}")
+        return 0
+
+    try:
+        cfg = _build_direct_eval_config(workflow_request)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+
+    _eval_libero_impl(cfg)
+    return 0
+
+
 if __name__ == "__main__":
-    eval_libero()
+    if len(sys.argv) == 1:
+        raise SystemExit(_run_interactive_libero_eval())
+    entrypoint: Any = eval_libero
+    entrypoint()
