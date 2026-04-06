@@ -13,8 +13,8 @@ WORKFLOW_WORKLOAD_KEY_ENV_KEY = "OPENVLA_WORKFLOW_WORKLOAD_KEY"
 WORKFLOW_BENCHMARK_ENV_KEY = "OPENVLA_WORKFLOW_BENCHMARK"
 WORKFLOW_MODEL_FAMILY_ENV_KEY = "OPENVLA_WORKFLOW_MODEL_FAMILY"
 WORKFLOW_CONTROLLER_PYTHON_ENV_KEY = "OPENVLA_WORKFLOW_CONTROLLER_PYTHON"
-WORKFLOW_SELECTED_GPU_COUNT_ENV_KEY = "OPENVLA_WORKFLOW_SELECTED_GPU_COUNT"
-WORKFLOW_SELECTED_GPU_IDS_ENV_KEY = "OPENVLA_WORKFLOW_SELECTED_GPU_IDS"
+WORKFLOW_SELECTED_GPU_ENV_KEY = "OPENVLA_WORKFLOW_SELECTED_GPU"
+WORKFLOW_SELECTED_CUDA_VISIBLE_DEVICES_ENV_KEY = "OPENVLA_WORKFLOW_SELECTED_CUDA_VISIBLE_DEVICES"
 
 _TRACEBACK_FRAME_RE = re.compile(r'^\s*File "(?P<file>.+)", line (?P<line>\d+), in (?P<function>.+)$')
 _FIELD_ORDER = (
@@ -25,8 +25,8 @@ _FIELD_ORDER = (
     "model_family",
     "controller_python",
     "effective_workload_python",
-    "selected_gpu_count",
-    "selected_gpu_ids",
+    "selected_gpu",
+    "selected_cuda_visible_devices",
     "failure_phase",
     "failure_location",
     "exception_type",
@@ -165,6 +165,13 @@ def failure_metadata_from_output(
 
 def child_launch_metadata_from_env(*, default_launch_path: str, defaults: Mapping[str, Any] | None = None) -> dict[str, Any]:
     defaults = defaults or {}
+    selected_gpu = os.environ.get(WORKFLOW_SELECTED_GPU_ENV_KEY, "").strip() or defaults.get("selected_gpu")
+    selected_cuda_visible_devices = (
+        os.environ.get(WORKFLOW_SELECTED_CUDA_VISIBLE_DEVICES_ENV_KEY, "").strip()
+        or defaults.get("selected_cuda_visible_devices")
+    )
+    if not selected_cuda_visible_devices:
+        selected_cuda_visible_devices = selected_gpu
     return {
         "timestamp": iso_timestamp(),
         "launch_path": os.environ.get(WORKFLOW_LAUNCH_PATH_ENV_KEY, "").strip() or default_launch_path,
@@ -173,6 +180,6 @@ def child_launch_metadata_from_env(*, default_launch_path: str, defaults: Mappin
         "model_family": os.environ.get(WORKFLOW_MODEL_FAMILY_ENV_KEY, "").strip() or defaults.get("model_family"),
         "controller_python": os.environ.get(WORKFLOW_CONTROLLER_PYTHON_ENV_KEY, "").strip() or defaults.get("controller_python"),
         "effective_workload_python": sys.executable,
-        "selected_gpu_count": os.environ.get(WORKFLOW_SELECTED_GPU_COUNT_ENV_KEY, "").strip() or defaults.get("selected_gpu_count"),
-        "selected_gpu_ids": os.environ.get(WORKFLOW_SELECTED_GPU_IDS_ENV_KEY, "").strip() or defaults.get("selected_gpu_ids"),
+        "selected_gpu": selected_gpu,
+        "selected_cuda_visible_devices": selected_cuda_visible_devices,
     }

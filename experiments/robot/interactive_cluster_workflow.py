@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 from experiments.robot.interactive_workflow_contract import (
     CANONICAL_PARENT_ARTIFACT_ROOT,
     CHECKPOINT_MAP,
+    SUPPORTED_GPU_NUMBERS,
     prompt_for_workflow_request,
 )
 from experiments.robot.maniskill.defaults import DEFAULT_GPU_INDEX_ENV_KEY
@@ -28,8 +29,8 @@ from experiments.robot.workflow_logging import (
     WORKFLOW_CONTROLLER_PYTHON_ENV_KEY,
     WORKFLOW_LAUNCH_PATH_ENV_KEY,
     WORKFLOW_MODEL_FAMILY_ENV_KEY,
-    WORKFLOW_SELECTED_GPU_COUNT_ENV_KEY,
-    WORKFLOW_SELECTED_GPU_IDS_ENV_KEY,
+    WORKFLOW_SELECTED_CUDA_VISIBLE_DEVICES_ENV_KEY,
+    WORKFLOW_SELECTED_GPU_ENV_KEY,
     WORKFLOW_WORKLOAD_KEY_ENV_KEY,
     append_breadcrumb_block,
     failure_metadata_from_exception,
@@ -51,8 +52,8 @@ CHILD_STDOUT_KEYS = (
     "model_family",
     "controller_python",
     "effective_workload_python",
-    "selected_gpu_count",
-    "selected_gpu_ids",
+    "selected_gpu",
+    "selected_cuda_visible_devices",
     "failure_phase",
     "failure_location",
     "exception_type",
@@ -160,7 +161,7 @@ def _controller_input_required_message() -> str:
     return (
         "INTERACTIVE_INPUT_REQUIRED: `python3 experiments/robot/interactive_cluster_workflow.py` "
         "requires operator input on stdin. Launch the controller directly and provide workload, mode, "
-        "artifact root, GPU count, GPU ID, and confirmation responses."
+        "artifact root, GPU number, and confirmation responses."
     )
 
 
@@ -223,23 +224,17 @@ def _json_dumps_compact(payload: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, default=_json_default)
 
 
-def _normalize_gpu_count(value: object) -> int | None:
+def _normalize_manual_gpu_number(value: object) -> str | None:
     normalized = str(value or "").strip()
     if not normalized:
         return None
     try:
-        return int(normalized)
+        canonical = str(int(normalized, 10))
     except ValueError:
         return None
-
-
-def _normalize_gpu_ids(value: object) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    normalized = str(value or "").strip()
-    if not normalized:
-        return []
-    return [item.strip() for item in normalized.split(",") if item.strip()]
+    if canonical not in SUPPORTED_GPU_NUMBERS:
+        return None
+    return canonical
 
 
 def _query_nvidia_smi_gpu_rows() -> tuple[list[dict[str, int]], str | None]:
@@ -292,11 +287,10 @@ def _compute_gpu_prompt_context() -> dict[str, Any]:
         visible_devices = [entry.strip() for entry in visible_devices_raw.split(",") if entry.strip()]
 
     context: dict[str, Any] = {
-        "status": "blocked",
+        "status": "ready",
         "execution_model": "serial_controller_dispatch",
-        "supported_gpu_counts": ["1", "2"],
-        "available_gpu_ids": [],
-        "reason": "Manual GPU selection preflight not evaluated.",
+        "supported_gpu_numbers": list(SUPPORTED_GPU_NUMBERS),
+        "reason": "Manual GPU numbers 0..7 are trusted without controller-visible GPU gating.",
         "blocker": None,
         "host_observation": {
             "cuda_visible_devices_env": visible_devices_raw,
@@ -305,51 +299,20 @@ def _compute_gpu_prompt_context() -> dict[str, Any]:
         },
     }
 
-    if visible_devices_raw is not None and not visible_devices:
-        context["blocker"] = (
-            "GPU_PREFLIGHT_BLOCKED: `CUDA_VISIBLE_DEVICES` is explicitly set but hides all GPUs; "
-            "single-GPU scheduling cannot proceed."
-        )
-        context["reason"] = "The host environment explicitly masked every CUDA device."
-        return context
-
     try:
         torch = __import__("torch")
+        context["host_observation"]["torch_cuda_available"] = bool(torch.cuda.is_available())
+        context["host_observation"]["torch_visible_device_count"] = (
+            int(torch.cuda.device_count()) if bool(torch.cuda.is_available()) else 0
+        )
     except Exception as exc:
-        context["blocker"] = f"GPU_PREFLIGHT_BLOCKED: unable to import `torch` for CUDA discovery: {exc}"
-        context["reason"] = "Cannot validate explicit GPU IDs without torch CUDA discovery."
-        return context
-
-    cuda_available = bool(torch.cuda.is_available())
-    device_count = int(torch.cuda.device_count()) if cuda_available else 0
-    context["host_observation"].update(
-        {
-            "torch_cuda_available": cuda_available,
-            "torch_visible_device_count": device_count,
-        }
-    )
-
-    if not cuda_available or device_count < 1:
-        context["blocker"] = "GPU_PREFLIGHT_BLOCKED: no CUDA device is available to the controller for explicit GPU selection."
-        context["reason"] = "The controller will not accept manual GPU IDs on a no-GPU host."
-        return context
-
-    available_gpu_ids = visible_devices or [str(index) for index in range(device_count)]
-    context["available_gpu_ids"] = available_gpu_ids
+        context["host_observation"]["torch_cuda_available"] = None
+        context["host_observation"]["torch_visible_device_count"] = None
+        context["host_observation"]["torch_discovery_error"] = str(exc)
 
     smi_rows, smi_error = _query_nvidia_smi_gpu_rows()
-    available_gpu_set = set(available_gpu_ids)
-    filtered_smi_rows = [row for row in smi_rows if str(row.get("index")) in available_gpu_set]
     context["host_observation"]["nvidia_smi_rows"] = smi_rows
     context["host_observation"]["nvidia_smi_error"] = smi_error
-    context["host_observation"]["nvidia_smi_rows_considered"] = filtered_smi_rows
-
-    context.update(
-        {
-            "status": "ready",
-            "reason": "Explicit GPU count and ordered GPU IDs can be validated for the controller's serial execution model.",
-        }
-    )
     return context
 
 
@@ -359,19 +322,17 @@ def _resolve_gpu_assignment(
     gpu_prompt_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt_context = dict(gpu_prompt_context or _compute_gpu_prompt_context())
+    requested_gpu_number = _normalize_manual_gpu_number(
+        workflow_request.get("selected_gpu_number", workflow_request.get("gpu_number"))
+    )
     assignment: dict[str, Any] = {
         "status": str(prompt_context.get("status") or "blocked"),
         "execution_model": str(prompt_context.get("execution_model") or "serial_controller_dispatch"),
-        "available_gpu_ids": _as_string_list(prompt_context.get("available_gpu_ids")),
-        "supported_gpu_counts": _as_string_list(prompt_context.get("supported_gpu_counts")),
-        "requested_gpu_count": _normalize_gpu_count(
-            workflow_request.get("selected_gpu_count", workflow_request.get("gpu_count"))
-        ),
-        "requested_gpu_ids": _normalize_gpu_ids(workflow_request.get("selected_gpu_ids", workflow_request.get("gpu_ids"))),
+        "supported_gpu_numbers": _as_string_list(prompt_context.get("supported_gpu_numbers")),
+        "requested_gpu_number": requested_gpu_number,
         "selected_gpu": None,
-        "selected_gpu_count": None,
-        "selected_gpu_ids": [],
-        "cuda_visible_devices": None,
+        "selected_cuda_visible_devices": None,
+        "selection_source": None,
         "reason": str(prompt_context.get("reason") or "GPU preflight not evaluated."),
         "blocker": prompt_context.get("blocker"),
         "host_observation": _as_dict(prompt_context.get("host_observation")),
@@ -381,57 +342,20 @@ def _resolve_gpu_assignment(
     if assignment["status"] != "ready":
         return assignment
 
-    available_gpu_ids = _as_string_list(assignment.get("available_gpu_ids"))
-    requested_gpu_count = assignment.get("requested_gpu_count")
-    requested_gpu_ids = _as_string_list(assignment.get("requested_gpu_ids"))
-    visible_devices_raw = assignment["host_observation"].get("cuda_visible_devices_env")
-
-    if requested_gpu_count not in (1, 2):
+    if requested_gpu_number is None:
         assignment["status"] = "blocked"
-        assignment["blocker"] = (
-            f"GPU_PREFLIGHT_BLOCKED: unsupported GPU count {requested_gpu_count!r}. Supported counts: 1, 2."
-        )
-        assignment["reason"] = "The runtime plan only supports explicit GPU counts of 1 or 2."
+        supported = ", ".join(SUPPORTED_GPU_NUMBERS)
+        raw_value = workflow_request.get("selected_gpu_number", workflow_request.get("gpu_number"))
+        assignment["blocker"] = f"INVALID_GPU_NUMBER: {str(raw_value).strip() or '<blank>'}. Supported values: {supported}"
+        assignment["reason"] = "The runtime plan accepts only manual GPU numbers 0..7."
         return assignment
 
-    if len(set(requested_gpu_ids)) != len(requested_gpu_ids):
-        assignment["status"] = "blocked"
-        assignment["blocker"] = f"GPU_PREFLIGHT_BLOCKED: duplicate GPU IDs are not allowed: {requested_gpu_ids}"
-        assignment["reason"] = "The runtime plan rejects duplicate GPU IDs so CUDA_VISIBLE_DEVICES stays coherent."
-        return assignment
-
-    if len(requested_gpu_ids) != requested_gpu_count:
-        assignment["status"] = "blocked"
-        assignment["blocker"] = (
-            "GPU_PREFLIGHT_BLOCKED: selected GPU count "
-            f"{requested_gpu_count} does not match explicit GPU IDs {requested_gpu_ids}."
-        )
-        assignment["reason"] = "The runtime plan requires the GPU count to match the explicit ordered GPU ID list."
-        return assignment
-
-    unavailable_gpu_ids = [gpu_id for gpu_id in requested_gpu_ids if gpu_id not in available_gpu_ids]
-    if unavailable_gpu_ids:
-        assignment["status"] = "blocked"
-        assignment["blocker"] = (
-            "GPU_PREFLIGHT_BLOCKED: explicit GPU ID(s) "
-            f"{unavailable_gpu_ids} are not available to the controller"
-            + (f" under CUDA_VISIBLE_DEVICES={visible_devices_raw!r}." if visible_devices_raw is not None else ".")
-        )
-        assignment["reason"] = "The explicit GPU IDs conflict with the controller-visible CUDA devices."
-        return assignment
-
-    selected_cuda_visible_devices = ",".join(requested_gpu_ids)
-    assignment["selection_trace"] = ["using explicit workflow_request.selected_gpu_ids in operator order"]
-    assignment["selected_gpu"] = {
-        "gpu": requested_gpu_ids[0],
-        "selection_source": "workflow_request.selected_gpu_ids[0]",
-        "cuda_visible_devices": selected_cuda_visible_devices,
-        "reason": "The first selected GPU ID is exported for compatibility while CUDA_VISIBLE_DEVICES preserves the full ordered list.",
-    }
-    assignment["selected_gpu_count"] = requested_gpu_count
-    assignment["selected_gpu_ids"] = requested_gpu_ids
-    assignment["cuda_visible_devices"] = selected_cuda_visible_devices
-    assignment["reason"] = "Explicit manual GPU selection was accepted for all GPU-heavy phases."
+    selected_cuda_visible_devices = requested_gpu_number
+    assignment["selection_trace"] = ["using explicit workflow_request.selected_gpu_number without controller-visible gating"]
+    assignment["selected_gpu"] = requested_gpu_number
+    assignment["selected_cuda_visible_devices"] = selected_cuda_visible_devices
+    assignment["selection_source"] = "workflow_request.selected_gpu_number"
+    assignment["reason"] = "Explicit manual GPU number selection was accepted unchanged for all GPU-heavy phases."
     return assignment
 
 
@@ -523,7 +447,8 @@ def _build_runtime_plan(
                 "benchmark": str(workload_detail.get("benchmark", "")),
                 "model_family": str(workload_detail.get("model_family", "")),
                 "artifact_root": artifact_root,
-                "selected_gpu": _as_dict(gpu_assignment.get("selected_gpu")) or None,
+                "selected_gpu": gpu_assignment.get("selected_gpu"),
+                "selected_cuda_visible_devices": gpu_assignment.get("selected_cuda_visible_devices"),
                 "estimated_work": estimated_work,
                 "workload_blockers": [
                     blocker for blocker in integrated_workflow_blockers if blocker.get("workload_key") == workload_key
@@ -566,10 +491,8 @@ def _scheduler_execution_policy(runtime_plan: dict[str, Any]) -> dict[str, Any]:
         "actual_execution": "serialized_single_gpu_gpu_heavy_phases",
         "gpu_heavy_execution": str(runtime_plan.get("gpu_heavy_execution", "serialized_single_gpu")),
         "reason": str(runtime_plan.get("scheduling_reason", "")),
-        "selected_gpu": _as_dict(gpu_assignment.get("selected_gpu")) or None,
-        "selected_gpu_count": gpu_assignment.get("selected_gpu_count"),
-        "selected_gpu_ids": gpu_assignment.get("selected_gpu_ids"),
-        "cuda_visible_devices": gpu_assignment.get("cuda_visible_devices"),
+        "selected_gpu": gpu_assignment.get("selected_gpu"),
+        "selected_cuda_visible_devices": gpu_assignment.get("selected_cuda_visible_devices"),
         "preflight_status": gpu_assignment.get("status"),
         "preflight_blocker": gpu_assignment.get("blocker"),
     }
@@ -583,12 +506,13 @@ def _build_child_env(
 ) -> dict[str, str]:
     child_env = dict(os.environ)
     gpu_assignment = _as_dict(runtime_plan.get("gpu_assignment"))
-    selected_gpu = _as_dict(gpu_assignment.get("selected_gpu"))
-    selected_gpu_ids = _as_string_list(gpu_assignment.get("selected_gpu_ids"))
-    compatibility_gpu_index = str(selected_gpu.get("gpu", "")).strip()
-    selected_cuda_visible_devices = ",".join(selected_gpu_ids) or str(selected_gpu.get("cuda_visible_devices", "")).strip()
+    compatibility_gpu_index = str(gpu_assignment.get("selected_gpu") or "").strip()
+    selected_cuda_visible_devices = str(gpu_assignment.get("selected_cuda_visible_devices") or "").strip()
+    if compatibility_gpu_index:
+        child_env[WORKFLOW_SELECTED_GPU_ENV_KEY] = compatibility_gpu_index
     if selected_cuda_visible_devices:
         child_env["CUDA_VISIBLE_DEVICES"] = selected_cuda_visible_devices
+        child_env[WORKFLOW_SELECTED_CUDA_VISIBLE_DEVICES_ENV_KEY] = selected_cuda_visible_devices
     if compatibility_gpu_index:
         child_env[DEFAULT_GPU_INDEX_ENV_KEY] = compatibility_gpu_index
     if managed_openpi_runtime is not None:
@@ -628,8 +552,8 @@ def _controller_launch_metadata(
         "model_family": str(workload_details.get("model_family", "")),
         "controller_python": str(controller_interpreter.get("selected_python") or sys.executable),
         "effective_workload_python": effective_workload_python,
-        "selected_gpu_count": gpu_assignment.get("selected_gpu_count"),
-        "selected_gpu_ids": _as_string_list(gpu_assignment.get("selected_gpu_ids")),
+        "selected_gpu": gpu_assignment.get("selected_gpu"),
+        "selected_cuda_visible_devices": gpu_assignment.get("selected_cuda_visible_devices"),
     }
 
 
@@ -668,8 +592,10 @@ def _apply_workload_child_env(child_env: dict[str, str], launch_metadata: dict[s
     child_env[WORKFLOW_BENCHMARK_ENV_KEY] = str(launch_metadata.get("benchmark") or "")
     child_env[WORKFLOW_MODEL_FAMILY_ENV_KEY] = str(launch_metadata.get("model_family") or "")
     child_env[WORKFLOW_CONTROLLER_PYTHON_ENV_KEY] = str(launch_metadata.get("controller_python") or sys.executable)
-    child_env[WORKFLOW_SELECTED_GPU_COUNT_ENV_KEY] = str(launch_metadata.get("selected_gpu_count") or "")
-    child_env[WORKFLOW_SELECTED_GPU_IDS_ENV_KEY] = ",".join(_as_string_list(launch_metadata.get("selected_gpu_ids")))
+    child_env[WORKFLOW_SELECTED_GPU_ENV_KEY] = str(launch_metadata.get("selected_gpu") or "")
+    child_env[WORKFLOW_SELECTED_CUDA_VISIBLE_DEVICES_ENV_KEY] = str(
+        launch_metadata.get("selected_cuda_visible_devices") or ""
+    )
     return child_env
 
 
@@ -695,8 +621,9 @@ def _build_execution_record(
         "model_family": launch_metadata.get("model_family"),
         "controller_python": launch_metadata.get("controller_python"),
         "effective_workload_python": parsed_stdout.get("effective_workload_python") or launch_metadata.get("effective_workload_python"),
-        "selected_gpu_count": launch_metadata.get("selected_gpu_count"),
-        "selected_gpu_ids": launch_metadata.get("selected_gpu_ids"),
+        "selected_gpu": parsed_stdout.get("selected_gpu") or launch_metadata.get("selected_gpu"),
+        "selected_cuda_visible_devices": parsed_stdout.get("selected_cuda_visible_devices")
+        or launch_metadata.get("selected_cuda_visible_devices"),
         "failure_phase": failure_details.get("failure_phase"),
         "failure_location": failure_details.get("failure_location"),
         "exception_type": failure_details.get("exception_type"),
@@ -742,8 +669,9 @@ def _controller_child_result(
         "launch_path": launch_metadata.get("launch_path"),
         "controller_python": launch_metadata.get("controller_python"),
         "effective_workload_python": parsed_stdout.get("effective_workload_python") or launch_metadata.get("effective_workload_python"),
-        "selected_gpu_count": launch_metadata.get("selected_gpu_count"),
-        "selected_gpu_ids": launch_metadata.get("selected_gpu_ids"),
+        "selected_gpu": parsed_stdout.get("selected_gpu") or launch_metadata.get("selected_gpu"),
+        "selected_cuda_visible_devices": parsed_stdout.get("selected_cuda_visible_devices")
+        or launch_metadata.get("selected_cuda_visible_devices"),
         "command": command,
         "summary_path": parsed_stdout.get("summary_path") or None,
         "manifest_path": parsed_stdout.get("manifest_path") or None,
@@ -807,10 +735,8 @@ def _emit_plan_preview(
         "artifact_root_overridden": workflow_request.get("artifact_root_overridden"),
         "requested_artifact_root": workflow_request.get("artifact_root"),
         "gpu_heavy_execution": runtime_plan.get("gpu_heavy_execution"),
-        "available_gpu_ids": gpu_assignment.get("available_gpu_ids"),
-        "selected_gpu_count": gpu_assignment.get("selected_gpu_count"),
-        "selected_gpu_ids": gpu_assignment.get("selected_gpu_ids"),
         "selected_gpu": gpu_assignment.get("selected_gpu"),
+        "selected_cuda_visible_devices": gpu_assignment.get("selected_cuda_visible_devices"),
         "gpu_assignment": gpu_assignment,
         "workflow_blockers": runtime_plan.get("workflow_blockers"),
         "planned_workloads": runtime_plan.get("planned_workloads"),
@@ -1492,6 +1418,8 @@ def _failed_execution_result(
 
 def _parse_child_result(*, workload_key: str, command: list[str], output_text: str, exit_code: int, log_path: Path) -> dict[str, Any]:
     parsed_stdout = _parse_key_values(output_text)
+    parsed_selected_gpu = parsed_stdout.get("selected_gpu") or None
+    parsed_selected_cuda_visible_devices = parsed_stdout.get("selected_cuda_visible_devices") or parsed_selected_gpu
     summary_path = parsed_stdout.get("summary_path", "")
     summary_payload = _load_summary_payload(summary_path)
     manifest_path = parsed_stdout.get("manifest_path", "")
@@ -1586,8 +1514,8 @@ def _parse_child_result(*, workload_key: str, command: list[str], output_text: s
         "launch_path": parsed_stdout.get("launch_path") or None,
         "controller_python": parsed_stdout.get("controller_python") or None,
         "effective_workload_python": parsed_stdout.get("effective_workload_python") or None,
-        "selected_gpu_count": parsed_stdout.get("selected_gpu_count") or None,
-        "selected_gpu_ids": _normalize_gpu_ids(parsed_stdout.get("selected_gpu_ids")),
+        "selected_gpu": parsed_selected_gpu,
+        "selected_cuda_visible_devices": parsed_selected_cuda_visible_devices,
     }
 
 
@@ -1668,8 +1596,8 @@ def _run_maniskill_inprocess(
             "launch_path": launch_metadata.get("launch_path"),
             "controller_python": launch_metadata.get("controller_python"),
             "effective_workload_python": launch_metadata.get("effective_workload_python"),
-            "selected_gpu_count": launch_metadata.get("selected_gpu_count"),
-            "selected_gpu_ids": launch_metadata.get("selected_gpu_ids"),
+            "selected_gpu": launch_metadata.get("selected_gpu"),
+            "selected_cuda_visible_devices": launch_metadata.get("selected_cuda_visible_devices"),
         }
 
     return {
@@ -1697,8 +1625,8 @@ def _run_maniskill_inprocess(
         "launch_path": launch_metadata.get("launch_path"),
         "controller_python": launch_metadata.get("controller_python"),
         "effective_workload_python": launch_metadata.get("effective_workload_python"),
-        "selected_gpu_count": launch_metadata.get("selected_gpu_count"),
-        "selected_gpu_ids": launch_metadata.get("selected_gpu_ids"),
+        "selected_gpu": launch_metadata.get("selected_gpu"),
+        "selected_cuda_visible_devices": launch_metadata.get("selected_cuda_visible_devices"),
     }
 
 
@@ -1772,8 +1700,8 @@ def _run_libero_inprocess(
             "launch_path": launch_metadata.get("launch_path"),
             "controller_python": launch_metadata.get("controller_python"),
             "effective_workload_python": launch_metadata.get("effective_workload_python"),
-            "selected_gpu_count": launch_metadata.get("selected_gpu_count"),
-            "selected_gpu_ids": launch_metadata.get("selected_gpu_ids"),
+            "selected_gpu": launch_metadata.get("selected_gpu"),
+            "selected_cuda_visible_devices": launch_metadata.get("selected_cuda_visible_devices"),
         }
 
     return {
@@ -1801,8 +1729,8 @@ def _run_libero_inprocess(
         "launch_path": launch_metadata.get("launch_path"),
         "controller_python": launch_metadata.get("controller_python"),
         "effective_workload_python": launch_metadata.get("effective_workload_python"),
-        "selected_gpu_count": launch_metadata.get("selected_gpu_count"),
-        "selected_gpu_ids": launch_metadata.get("selected_gpu_ids"),
+        "selected_gpu": launch_metadata.get("selected_gpu"),
+        "selected_cuda_visible_devices": launch_metadata.get("selected_cuda_visible_devices"),
     }
 
 
@@ -2047,8 +1975,6 @@ def _run_controller() -> int:
             input_fn=_controller_prompt_input,
             output_fn=print,
             default_artifact_root=CANONICAL_PARENT_ARTIFACT_ROOT,
-            visible_gpu_count=len(_as_string_list(gpu_prompt_context.get("available_gpu_ids"))),
-            visible_gpu_ids=tuple(_as_string_list(gpu_prompt_context.get("available_gpu_ids"))),
         )
     except ValueError as exc:
         print(str(exc))
@@ -2082,18 +2008,15 @@ def _run_controller() -> int:
         ),
         "controller_python": str(_current_controller_interpreter_resolution().get("selected_python") or sys.executable),
         "effective_workload_python": None,
-        "selected_gpu_count": execution_policy.get("selected_gpu_count"),
-        "selected_gpu_ids": execution_policy.get("selected_gpu_ids"),
+        "selected_gpu": execution_policy.get("selected_gpu"),
+        "selected_cuda_visible_devices": execution_policy.get("selected_cuda_visible_devices"),
     }
     _write_controller_event(controller_log_path, controller_launch_metadata, heading="launch")
-    selected_gpu = _as_dict(_as_dict(runtime_plan.get("gpu_assignment")).get("selected_gpu"))
     print(f"execution_model={execution_policy['execution_model']}")
     print(f"scheduler_gpu_heavy_execution={execution_policy['gpu_heavy_execution']}")
     print(f"scheduler_preflight_status={execution_policy['preflight_status']}")
-    print(f"scheduler_selected_gpu={selected_gpu.get('gpu')}")
-    print(f"selected_gpu_count={execution_policy['selected_gpu_count']}")
-    print(f"selected_gpu_ids={execution_policy['selected_gpu_ids']}")
-    print(f"scheduler_selected_cuda_visible_devices={execution_policy['cuda_visible_devices']}")
+    print(f"scheduler_selected_gpu={execution_policy['selected_gpu']}")
+    print(f"scheduler_selected_cuda_visible_devices={execution_policy['selected_cuda_visible_devices']}")
     print(f"scheduler_reason={execution_policy['reason']}")
     if execution_policy.get("preflight_blocker"):
         print(f"scheduler_blocker={execution_policy['preflight_blocker']}")
