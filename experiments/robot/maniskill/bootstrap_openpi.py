@@ -6,6 +6,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import asdict
@@ -63,6 +64,7 @@ class RuntimeMetadata:
     policy_server_launch_prefix: str
     checkpoint: str
     openpi_conda_env: str
+    bootstrap_python: str
 
 
 def _cache_parent_root() -> Path:
@@ -410,6 +412,7 @@ def _build_metadata(args: argparse.Namespace) -> RuntimeMetadata:
         policy_server_launch_prefix=_policy_server_launch_prefix(repo_root),
         checkpoint=checkpoint,
         openpi_conda_env=openpi_conda_env,
+        bootstrap_python=sys.executable,
     )
 
 
@@ -430,6 +433,7 @@ def _print_metadata(metadata: RuntimeMetadata) -> None:
     print(f"openpi_policy_server_launch_prefix={metadata.policy_server_launch_prefix}")
     print(f"openpi_checkpoint={metadata.checkpoint}")
     print(f"openpi_conda_env={metadata.openpi_conda_env}")
+    print(f"openpi_bootstrap_python={metadata.bootstrap_python}")
 
 
 def parse_args() -> argparse.Namespace:

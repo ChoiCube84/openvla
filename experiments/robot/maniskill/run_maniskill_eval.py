@@ -31,7 +31,6 @@ from experiments.robot.maniskill.checkpoint_guard import (
     resolve_checkpoint_target,
     validate_checkpoint_reference,
 )
-from experiments.robot.interactive_workflow_contract import prompt_for_workflow_request
 from experiments.robot.maniskill.backends import get_backend
 from experiments.robot.maniskill.defaults import (
     ARTIFACT_ROOT,
@@ -50,6 +49,7 @@ from experiments.robot.maniskill.maniskill_utils import (
     extract_image_observation,
     interpret_step_outcome,
 )
+from experiments.robot.workflow_logging import child_launch_metadata_from_env, emit_breadcrumb, failure_metadata_from_exception
 
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 
@@ -80,12 +80,18 @@ class ManiSkillEvalConfig:
 
     run_id_note: Optional[str] = None
     local_log_dir: str = "./experiments/logs"
+    controller_log_path: str = ""
     artifact_root: str = ARTIFACT_ROOT
     seed: int = 7
 
 
 JUELG_MANISKILL_UNNORM_KEY = "maniskill_human:7.0.0"
 DIRECT_MANISKILL_WORKLOAD_KEYS = ("openvla_maniskill_ft", "openpi_maniskill")
+DIRECT_RUNNER_GUIDANCE = (
+    "DIRECT_MANISKILL_RUNNER_UNSUPPORTED: launch ManiSkill workloads through "
+    "`python3 experiments/robot/interactive_cluster_workflow.py` so the controller owns prompts, "
+    "logging, and failure attribution."
+)
 
 
 def _parse_task_ids(task_ids_csv: str) -> list[str]:
@@ -298,7 +304,7 @@ def _resolve_task_unnorm_key(cfg: ManiSkillEvalConfig, model: Any, task_id: str)
     )
 
 
-def _build_direct_prompt_config(workflow_request: dict[str, Any]) -> ManiSkillEvalConfig:
+def build_maniskill_config_from_workflow_request(workflow_request: dict[str, Any]) -> ManiSkillEvalConfig:
     if bool(workflow_request.get("cancelled")):
         reason = str(workflow_request.get("cancellation_reason", "USER_CANCELLED"))
         raise ValueError(reason)
@@ -354,70 +360,19 @@ def _build_direct_prompt_config(workflow_request: dict[str, Any]) -> ManiSkillEv
     return cfg
 
 
-def _run_direct_prompt_entrypoint() -> None:
-    try:
-        workflow_request = prompt_for_workflow_request(
-            supported_workload_keys=DIRECT_MANISKILL_WORKLOAD_KEYS,
-            default_artifact_root=ARTIFACT_ROOT,
-        )
-        cfg = _build_direct_prompt_config(workflow_request)
-    except ValueError as exc:
-        print(str(exc))
-        raise SystemExit(1) from exc
-
-    _eval_maniskill_impl(cfg)
-
-
-def _eval_maniskill_impl(cfg: ManiSkillEvalConfig) -> None:
-    try:
-        selected_task_ids = _parse_task_ids(cfg.task_ids)
-        episodes_per_task = _resolve_episode_count(cfg)
-    except ValueError as exc:
-        print(str(exc))
-        raise SystemExit(1)
-
-    if cfg.render_mode != "rgb_array":
-        raise ValueError("INVALID_RENDER_MODE: ManiSkill benchmark runner requires render_mode='rgb_array'.")
-
-    if cfg.load_in_8bit and cfg.load_in_4bit:
-        raise ValueError("INVALID_QUANTIZATION: cannot enable both load_in_8bit and load_in_4bit.")
-
-    cfg.pretrained_checkpoint = _resolve_checkpoint(cfg)
-    _set_seed_everywhere(cfg.seed)
-
-    try:
-        backend_info = _get_backend_info(cfg)
-        backend = get_backend(cfg.model_family)
-    except ValueError as exc:
-        print(str(exc))
-        raise SystemExit(1)
-
-    try:
-        if cfg.model_family == "openvla":
-            checkpoint_validation = validate_checkpoint_reference(
-                str(cfg.pretrained_checkpoint),
-                source_type="auto",
-                require_dataset_statistics=True,
-            )
-            print(
-                "CHECKPOINT_VALID: "
-                f"source_type={checkpoint_validation.source_type} "
-                f"checkpoint_reference={checkpoint_validation.checkpoint_reference}"
-            )
-    except CheckpointValidationError as exc:
-        print(f"{exc.tag}: {exc.message}")
-        raise SystemExit(1)
-
-    model = _get_model(cfg)
-    processor = _get_processor(cfg)
-    resize_size = _get_image_resize_size(cfg)
-
+def _eval_maniskill_impl(cfg: ManiSkillEvalConfig) -> dict[str, Any]:
     run_id = f"EVAL-maniskill-{cfg.mode}-{cfg.model_family}-{DATE_TIME}"
     if cfg.run_id_note:
         run_id = f"{run_id}--{cfg.run_id_note}"
 
-    os.makedirs(cfg.local_log_dir, exist_ok=True)
-    local_log_filepath = os.path.join(cfg.local_log_dir, f"{run_id}.txt")
+    controller_log_path = str(cfg.controller_log_path).strip()
+    if controller_log_path:
+        local_log_path = Path(controller_log_path)
+        local_log_path.parent.mkdir(parents=True, exist_ok=True)
+        local_log_filepath = str(local_log_path)
+    else:
+        os.makedirs(cfg.local_log_dir, exist_ok=True)
+        local_log_filepath = os.path.join(cfg.local_log_dir, f"{run_id}.txt")
     log_file = open(local_log_filepath, "w")
     print(f"Logging to local log file: {local_log_filepath}")
 
@@ -447,6 +402,58 @@ def _eval_maniskill_impl(cfg: ManiSkillEvalConfig) -> None:
     per_task_success_rate: dict[str, float] = {}
 
     try:
+        launch_metadata = child_launch_metadata_from_env(
+            default_launch_path="direct_maniskill_runner",
+            defaults={
+                "benchmark": "maniskill",
+                "model_family": cfg.model_family,
+            },
+        )
+        emit_breadcrumb(launch_metadata, log_file=log_file)
+
+        try:
+            selected_task_ids = _parse_task_ids(cfg.task_ids)
+            episodes_per_task = _resolve_episode_count(cfg)
+        except ValueError as exc:
+            print(str(exc))
+            raise SystemExit(1)
+
+        if cfg.render_mode != "rgb_array":
+            raise ValueError("INVALID_RENDER_MODE: ManiSkill benchmark runner requires render_mode='rgb_array'.")
+
+        if cfg.load_in_8bit and cfg.load_in_4bit:
+            raise ValueError("INVALID_QUANTIZATION: cannot enable both load_in_8bit and load_in_4bit.")
+
+        cfg.pretrained_checkpoint = _resolve_checkpoint(cfg)
+        _set_seed_everywhere(cfg.seed)
+
+        try:
+            backend_info = _get_backend_info(cfg)
+            backend = get_backend(cfg.model_family)
+        except ValueError as exc:
+            print(str(exc))
+            raise SystemExit(1)
+
+        try:
+            if cfg.model_family == "openvla":
+                checkpoint_validation = validate_checkpoint_reference(
+                    str(cfg.pretrained_checkpoint),
+                    source_type="auto",
+                    require_dataset_statistics=True,
+                )
+                print(
+                    "CHECKPOINT_VALID: "
+                    f"source_type={checkpoint_validation.source_type} "
+                    f"checkpoint_reference={checkpoint_validation.checkpoint_reference}"
+                )
+        except CheckpointValidationError as exc:
+            print(f"{exc.tag}: {exc.message}")
+            raise SystemExit(1)
+
+        model = _get_model(cfg)
+        processor = _get_processor(cfg)
+        resize_size = _get_image_resize_size(cfg)
+
         print(f"mode={cfg.mode} tasks={selected_task_ids} episodes_per_task={episodes_per_task} max_steps={cfg.max_steps_per_episode}")
         log_file.write(
             f"mode={cfg.mode} tasks={selected_task_ids} episodes_per_task={episodes_per_task} max_steps={cfg.max_steps_per_episode}\n"
@@ -638,6 +645,33 @@ def _eval_maniskill_impl(cfg: ManiSkillEvalConfig) -> None:
         log_file.write(f"episodes_path={artifact_paths['episodes']}\n")
         log_file.write(f"run_dir={run_dir}\n")
         log_file.flush()
+        return {
+            "summary_path": str(summary_path),
+            "manifest_path": str(artifact_paths["manifest"]),
+            "episodes_path": str(artifact_paths["episodes"]),
+            "run_dir": str(run_dir),
+            "average_success_rate": average_success_rate,
+            "per_task_success_rate": per_task_success_rate,
+            "checkpoint": str(cfg.pretrained_checkpoint),
+            "artifact_paths": artifact_paths,
+            "launch_metadata": launch_metadata,
+        }
+    except BaseException as exc:
+        failure_details = failure_metadata_from_exception(exc, failure_phase="maniskill_runner_execution")
+        emit_breadcrumb(
+            {
+                **child_launch_metadata_from_env(
+                    default_launch_path="direct_maniskill_runner",
+                    defaults={
+                        "benchmark": "maniskill",
+                        "model_family": cfg.model_family,
+                    },
+                ),
+                **failure_details,
+            },
+            log_file=log_file,
+        )
+        raise
     finally:
         log_file.close()
 
@@ -649,7 +683,8 @@ def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) == 1:
-        _run_direct_prompt_entrypoint()
+        print(DIRECT_RUNNER_GUIDANCE)
+        raise SystemExit(1)
     else:
         entrypoint: Any = eval_maniskill
         entrypoint()

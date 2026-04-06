@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import shlex
 import subprocess
 import sys
 import time
 import importlib
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,19 @@ from experiments.robot.interactive_workflow_contract import (
     prompt_for_workflow_request,
 )
 from experiments.robot.maniskill.defaults import DEFAULT_GPU_INDEX_ENV_KEY
+from experiments.robot.workflow_logging import (
+    WORKFLOW_BENCHMARK_ENV_KEY,
+    WORKFLOW_CONTROLLER_PYTHON_ENV_KEY,
+    WORKFLOW_LAUNCH_PATH_ENV_KEY,
+    WORKFLOW_MODEL_FAMILY_ENV_KEY,
+    WORKFLOW_SELECTED_GPU_COUNT_ENV_KEY,
+    WORKFLOW_SELECTED_GPU_IDS_ENV_KEY,
+    WORKFLOW_WORKLOAD_KEY_ENV_KEY,
+    append_breadcrumb_block,
+    failure_metadata_from_exception,
+    failure_metadata_from_output,
+    iso_timestamp,
+)
 
 PARENT_SUMMARY_FILENAME = "workflow_summary.json"
 RUNTIME_PLAN_FILENAME = "runtime_plan.json"
@@ -30,6 +45,19 @@ CHILD_STDOUT_KEYS = (
     "episodes_path",
     "average_success_rate",
     "run_dir",
+    "launch_path",
+    "workload_key",
+    "benchmark",
+    "model_family",
+    "controller_python",
+    "effective_workload_python",
+    "selected_gpu_count",
+    "selected_gpu_ids",
+    "failure_phase",
+    "failure_location",
+    "exception_type",
+    "exception_message",
+    "traceback_tail",
 )
 OPENPI_BOOTSTRAP_STDOUT_KEYS = (
     "openpi_runtime_status",
@@ -50,30 +78,22 @@ OPENPI_BOOTSTRAP_STDOUT_KEYS = (
     "openpi_policy_server_launch_prefix",
     "openpi_checkpoint",
     "openpi_conda_env",
+    "openpi_bootstrap_python",
 )
 MANISKILL_WORKLOADS = {"openvla_maniskill_ft", "openpi_maniskill"}
 LIBERO_WORKLOADS = {"openvla_libero", "openvla_libero_ft", "openpi_libero"}
+INPROCESS_WORKLOADS = MANISKILL_WORKLOADS | LIBERO_WORKLOADS
 MANAGED_OPENPI_POLICY_SERVER_WORKLOADS = {"openpi_maniskill", "openpi_libero"}
 DEFAULT_OPENPI_POLICY_CONFIG = "pi05_libero"
 POLICY_SERVER_HEALTH_TIMEOUT_SECONDS = 45.0
 POLICY_SERVER_HEALTH_POLL_SECONDS = 1.0
 GPU_HEAVY_PHASE_NAME = "gpu_eval"
-SINGLE_GPU_POLICY_NAME = "single_gpu_v1"
-CONTROLLER_PYTHON_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_PYTHON"
-CONTROLLER_CONDA_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_CONDA_ENV"
-CONTROLLER_INTERPRETER_LOCK_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_INTERPRETER_LOCKED"
-CONTROLLER_SELECTED_PYTHON_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_SELECTED_PYTHON"
-CONTROLLER_SELECTED_CONDA_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_SELECTED_CONDA_ENV"
-CONTROLLER_SELECTION_SOURCE_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_SELECTION_SOURCE"
-CONTROLLER_TORCH_VERSION_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_SELECTED_TORCH_VERSION"
-CONTROLLER_SELECTION_STATUS_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_INTERPRETER_STATUS"
-CONTROLLER_INTERPRETER_PROBE_PREFIX = "openvla_controller_interpreter_probe="
-KNOWN_CONTROLLER_CONDA_ENVS = ("openvla", "openpi")
 
 
-class ControllerInterpreterResolutionError(RuntimeError):
-    def __init__(self, payload: dict[str, Any]) -> None:
-        super().__init__(str(payload.get("remediation") or payload.get("reason") or "controller interpreter resolution failed"))
+class ManagedOpenPILifecycleError(RuntimeError):
+    def __init__(self, message: str, *, failure_phase: str, payload: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.failure_phase = failure_phase
         self.payload = payload
 
 
@@ -136,22 +156,19 @@ def _build_session_id() -> str:
     return f"WORKFLOW-{timestamp}-pid{os.getpid()}"
 
 
-def _controller_interpreter_probe_code() -> str:
+def _controller_input_required_message() -> str:
     return (
-        "import json\n"
-        "import sys\n"
-        "payload = {'python': sys.executable}\n"
-        "import torch\n"
-        "payload['torch_version'] = getattr(torch, '__version__', 'unknown')\n"
-        f"print({CONTROLLER_INTERPRETER_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True))\n"
+        "INTERACTIVE_INPUT_REQUIRED: `python3 experiments/robot/interactive_cluster_workflow.py` "
+        "requires operator input on stdin. Launch the controller directly and provide workload, mode, "
+        "artifact root, GPU count, GPU ID, and confirmation responses."
     )
 
 
-def _normalize_executable_path(path: str) -> str:
+def _controller_prompt_input(prompt: str) -> str:
     try:
-        return str(Path(path).expanduser().resolve())
-    except Exception:
-        return path
+        return input(prompt)
+    except EOFError as exc:
+        raise ValueError(_controller_input_required_message()) from exc
 
 
 def _tail_lines(text: str, *, keep: int = 6) -> str:
@@ -161,38 +178,13 @@ def _tail_lines(text: str, *, keep: int = 6) -> str:
     return " | ".join(nonempty[-keep:])
 
 
-def _controller_interpreter_remediation() -> str:
-    known_envs = ", ".join(KNOWN_CONTROLLER_CONDA_ENVS)
-    return (
-        "CONTROLLER_INTERPRETER_RESOLUTION_FAILED: no torch-capable controller interpreter was found. "
-        f"Try {CONTROLLER_CONDA_ENV_KEY}=openvla, {CONTROLLER_CONDA_ENV_KEY}=openpi, or set "
-        f"{CONTROLLER_PYTHON_ENV_KEY}=/absolute/path/to/python3 with torch installed. Auto-probed conda envs: {known_envs}; "
-        "final fallback: PATH python3."
-    )
-
-
-def _summarize_controller_attempts(attempts: list[dict[str, Any]]) -> str:
-    if not attempts:
-        return "no_attempts_recorded"
-    parts: list[str] = []
-    for attempt in attempts:
-        label = str(attempt.get("label") or attempt.get("source") or "unknown")
-        status = str(attempt.get("status") or "unknown")
-        error = str(attempt.get("error") or "").strip()
-        if error:
-            parts.append(f"{label}:{status} ({error})")
-        else:
-            parts.append(f"{label}:{status}")
-    return " | ".join(parts)
-
-
 def _describe_controller_interpreter(resolution: dict[str, Any]) -> str:
-    status = str(resolution.get("status") or "unknown")
-    source = str(resolution.get("selection_source") or "unknown")
+    status = str(resolution.get("status") or "active")
+    source = str(resolution.get("selection_source") or "direct_python")
     selected_python = str(resolution.get("selected_python") or sys.executable)
     selected_conda_env = str(resolution.get("selected_conda_env") or "none")
     torch_version = str(resolution.get("torch_version") or "unknown")
-    execution_mode = str(resolution.get("execution_mode") or ("locked_reexec" if resolution.get("lock_active") else "current_process"))
+    execution_mode = str(resolution.get("execution_mode") or "current_process")
     return (
         "CONTROLLER_INTERPRETER: "
         f"status={status}; source={source}; python={selected_python}; "
@@ -200,295 +192,21 @@ def _describe_controller_interpreter(resolution: dict[str, Any]) -> str:
     )
 
 
-def _parse_interpreter_probe(stdout: str) -> dict[str, Any] | None:
-    for line in stdout.splitlines():
-        if line.startswith(CONTROLLER_INTERPRETER_PROBE_PREFIX):
-            try:
-                payload = json.loads(line.split("=", 1)[1])
-            except Exception:
-                return None
-            return payload if isinstance(payload, dict) else None
-    return None
-
-
-def _probe_python_interpreter(python_executable: str, *, source: str, label: str) -> dict[str, Any]:
-    expanded_python = str(Path(python_executable).expanduser())
-    if not os.path.exists(expanded_python):
-        return {
-            "source": source,
-            "label": label,
-            "status": "missing",
-            "python": expanded_python,
-            "error": f"interpreter not found at `{expanded_python}`",
-        }
-    if not os.access(expanded_python, os.X_OK):
-        return {
-            "source": source,
-            "label": label,
-            "status": "missing",
-            "python": expanded_python,
-            "error": f"interpreter is not executable at `{expanded_python}`",
-        }
-    process = subprocess.run(
-        [expanded_python, "-c", _controller_interpreter_probe_code()],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
-    parsed = _parse_interpreter_probe(process.stdout or "")
-    if process.returncode == 0 and parsed is not None:
-        resolved_python = str(parsed.get("python") or expanded_python)
-        return {
-            "source": source,
-            "label": label,
-            "status": "ready",
-            "python": resolved_python,
-            "torch_version": str(parsed.get("torch_version") or "unknown"),
-            "error": None,
-        }
-    return {
-        "source": source,
-        "label": label,
-        "status": "rejected",
-        "python": expanded_python,
-        "error": _tail_lines(process.stdout or ""),
-    }
-
-
-def _probe_conda_env(conda_executable: str, env_name: str, *, source: str, label: str) -> dict[str, Any]:
-    process = subprocess.run(
-        [conda_executable, "run", "--no-capture-output", "-n", env_name, "python3", "-c", _controller_interpreter_probe_code()],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
-    parsed = _parse_interpreter_probe(process.stdout or "")
-    if process.returncode == 0 and parsed is not None:
-        return {
-            "source": source,
-            "label": label,
-            "status": "ready",
-            "python": str(parsed.get("python") or "python3"),
-            "conda_env": env_name,
-            "conda_executable": conda_executable,
-            "torch_version": str(parsed.get("torch_version") or "unknown"),
-            "error": None,
-        }
-    return {
-        "source": source,
-        "label": label,
-        "status": "rejected",
-        "python": None,
-        "conda_env": env_name,
-        "conda_executable": conda_executable,
-        "error": _tail_lines(process.stdout or ""),
-    }
-
-
-def _probe_path_python3() -> dict[str, Any]:
-    process = subprocess.run(
-        ["python3", "-c", _controller_interpreter_probe_code()],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
-    parsed = _parse_interpreter_probe(process.stdout or "")
-    if process.returncode == 0 and parsed is not None:
-        return {
-            "source": "path_python3",
-            "label": "PATH python3",
-            "status": "ready",
-            "python": str(parsed.get("python") or shutil.which("python3") or "python3"),
-            "torch_version": str(parsed.get("torch_version") or "unknown"),
-            "error": None,
-        }
-    return {
-        "source": "path_python3",
-        "label": "PATH python3",
-        "status": "rejected",
-        "python": shutil.which("python3") or "python3",
-        "error": _tail_lines(process.stdout or ""),
-    }
-
-
-def _resolve_controller_interpreter() -> dict[str, Any]:
-    attempts: list[dict[str, Any]] = []
-    explicit_python = os.environ.get(CONTROLLER_PYTHON_ENV_KEY, "").strip()
-    explicit_conda_env = os.environ.get(CONTROLLER_CONDA_ENV_KEY, "").strip()
-    conda_executable = shutil.which("conda")
-
-    if explicit_python:
-        probe = _probe_python_interpreter(
-            explicit_python,
-            source="explicit_python_env",
-            label=f"{CONTROLLER_PYTHON_ENV_KEY}={explicit_python}",
-        )
-        attempts.append(probe)
-        if probe["status"] == "ready":
-            return {
-                "status": "ready",
-                "selection_source": probe["source"],
-                "selected_python": probe["python"],
-                "selected_conda_env": None,
-                "torch_version": probe["torch_version"],
-                "attempts": attempts,
-                "requested_python": explicit_python,
-                "requested_conda_env": explicit_conda_env or None,
-            }
-
-    if explicit_conda_env:
-        if conda_executable:
-            probe = _probe_conda_env(
-                conda_executable,
-                explicit_conda_env,
-                source="explicit_conda_env",
-                label=f"{CONTROLLER_CONDA_ENV_KEY}={explicit_conda_env}",
-            )
-        else:
-            probe = {
-                "source": "explicit_conda_env",
-                "label": f"{CONTROLLER_CONDA_ENV_KEY}={explicit_conda_env}",
-                "status": "missing",
-                "python": None,
-                "conda_env": explicit_conda_env,
-                "error": "`conda` executable not found on PATH",
-            }
-        attempts.append(probe)
-        if probe["status"] == "ready":
-            return {
-                "status": "ready",
-                "selection_source": probe["source"],
-                "selected_python": probe["python"],
-                "selected_conda_env": explicit_conda_env,
-                "torch_version": probe["torch_version"],
-                "attempts": attempts,
-                "requested_python": explicit_python or None,
-                "requested_conda_env": explicit_conda_env,
-                "conda_executable": conda_executable,
-            }
-
-    if conda_executable:
-        for env_name in KNOWN_CONTROLLER_CONDA_ENVS:
-            if env_name == explicit_conda_env:
-                continue
-            probe = _probe_conda_env(
-                conda_executable,
-                env_name,
-                source=f"known_conda_env:{env_name}",
-                label=f"known conda env {env_name}",
-            )
-            attempts.append(probe)
-            if probe["status"] == "ready":
-                return {
-                    "status": "ready",
-                    "selection_source": probe["source"],
-                    "selected_python": probe["python"],
-                    "selected_conda_env": env_name,
-                    "torch_version": probe["torch_version"],
-                    "attempts": attempts,
-                    "requested_python": explicit_python or None,
-                    "requested_conda_env": explicit_conda_env or None,
-                    "conda_executable": conda_executable,
-                }
-    else:
-        attempts.append(
-            {
-                "source": "known_conda_envs",
-                "label": ", ".join(KNOWN_CONTROLLER_CONDA_ENVS),
-                "status": "missing",
-                "python": None,
-                "error": "`conda` executable not found on PATH",
-            }
-        )
-
-    path_probe = _probe_path_python3()
-    attempts.append(path_probe)
-    if path_probe["status"] == "ready":
-        return {
-            "status": "ready",
-            "selection_source": path_probe["source"],
-            "selected_python": path_probe["python"],
-            "selected_conda_env": None,
-            "torch_version": path_probe["torch_version"],
-            "attempts": attempts,
-            "requested_python": explicit_python or None,
-            "requested_conda_env": explicit_conda_env or None,
-        }
-
-    return {
-        "status": "blocked",
-        "selection_source": None,
-        "selected_python": None,
-        "selected_conda_env": None,
-        "torch_version": None,
-        "attempts": attempts,
-        "requested_python": explicit_python or None,
-        "requested_conda_env": explicit_conda_env or None,
-        "reason": "No torch-capable interpreter probe succeeded.",
-        "remediation": _controller_interpreter_remediation(),
-    }
-
-
-def _export_controller_interpreter_resolution(resolution: dict[str, Any]) -> None:
-    os.environ[CONTROLLER_SELECTION_STATUS_ENV_KEY] = str(resolution.get("status") or "unknown")
-    os.environ[CONTROLLER_SELECTION_SOURCE_ENV_KEY] = str(resolution.get("selection_source") or "")
-    os.environ[CONTROLLER_SELECTED_PYTHON_ENV_KEY] = str(resolution.get("selected_python") or "")
-    os.environ[CONTROLLER_SELECTED_CONDA_ENV_KEY] = str(resolution.get("selected_conda_env") or "")
-    os.environ[CONTROLLER_TORCH_VERSION_ENV_KEY] = str(resolution.get("torch_version") or "")
-
-
 def _current_controller_interpreter_resolution() -> dict[str, Any]:
+    torch_version = None
+    try:
+        torch = __import__("torch")
+        torch_version = str(getattr(torch, "__version__", "unknown"))
+    except Exception:
+        torch_version = None
     return {
-        "status": os.environ.get(CONTROLLER_SELECTION_STATUS_ENV_KEY, "unknown") or "unknown",
-        "selection_source": os.environ.get(CONTROLLER_SELECTION_SOURCE_ENV_KEY, "").strip() or None,
-        "selected_python": os.environ.get(CONTROLLER_SELECTED_PYTHON_ENV_KEY, "").strip() or sys.executable,
-        "selected_conda_env": os.environ.get(CONTROLLER_SELECTED_CONDA_ENV_KEY, "").strip() or None,
-        "torch_version": os.environ.get(CONTROLLER_TORCH_VERSION_ENV_KEY, "").strip() or None,
-        "requested_python": os.environ.get(CONTROLLER_PYTHON_ENV_KEY, "").strip() or None,
-        "requested_conda_env": os.environ.get(CONTROLLER_CONDA_ENV_KEY, "").strip() or None,
-        "lock_active": os.environ.get(CONTROLLER_INTERPRETER_LOCK_ENV_KEY, "").strip() == "1",
+        "status": "active",
+        "selection_source": "direct_python",
+        "selected_python": sys.executable,
+        "selected_conda_env": os.environ.get("CONDA_DEFAULT_ENV", "").strip() or None,
+        "torch_version": torch_version,
+        "execution_mode": "current_process",
     }
-
-
-def _same_interpreter(path_a: str | None, path_b: str | None) -> bool:
-    if not path_a or not path_b:
-        return False
-    return _normalize_executable_path(path_a) == _normalize_executable_path(path_b)
-
-
-def _ensure_controller_interpreter() -> dict[str, Any]:
-    if os.environ.get(CONTROLLER_INTERPRETER_LOCK_ENV_KEY, "").strip() == "1":
-        return _current_controller_interpreter_resolution()
-
-    resolution = _resolve_controller_interpreter()
-    if resolution.get("status") != "ready":
-        raise ControllerInterpreterResolutionError(resolution)
-
-    selected_python = str(resolution.get("selected_python") or "")
-    selected_conda_env = str(resolution.get("selected_conda_env") or "").strip() or None
-    resolution["reexec_required"] = bool(selected_conda_env or not _same_interpreter(selected_python, sys.executable))
-    _export_controller_interpreter_resolution(resolution)
-
-    if not resolution["reexec_required"]:
-        resolution["execution_mode"] = "current_process"
-        return resolution
-
-    env = dict(os.environ)
-    env[CONTROLLER_INTERPRETER_LOCK_ENV_KEY] = "1"
-    env[CONTROLLER_SELECTION_STATUS_ENV_KEY] = "ready"
-    env[CONTROLLER_SELECTION_SOURCE_ENV_KEY] = str(resolution.get("selection_source") or "")
-    env[CONTROLLER_SELECTED_PYTHON_ENV_KEY] = selected_python
-    env[CONTROLLER_SELECTED_CONDA_ENV_KEY] = str(selected_conda_env or "")
-    env[CONTROLLER_TORCH_VERSION_ENV_KEY] = str(resolution.get("torch_version") or "")
-    script_path = str(Path(__file__).resolve())
-    if selected_conda_env:
-        conda_executable = str(resolution.get("conda_executable") or shutil.which("conda") or "conda")
-        command = [conda_executable, "run", "--no-capture-output", "-n", selected_conda_env, "python3", script_path, *sys.argv[1:]]
-        os.execvpe(conda_executable, command, env)
-    os.execvpe(selected_python, [selected_python, script_path, *sys.argv[1:]], env)
 
 
 def _build_parent_paths(session_id: str) -> dict[str, Path]:
@@ -497,6 +215,7 @@ def _build_parent_paths(session_id: str) -> dict[str, Path]:
         "session_dir": session_dir,
         "summary_path": session_dir / PARENT_SUMMARY_FILENAME,
         "runtime_plan_path": session_dir / RUNTIME_PLAN_FILENAME,
+        "controller_log_path": session_dir / "controller.log",
     }
 
 
@@ -504,9 +223,23 @@ def _json_dumps_compact(payload: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, default=_json_default)
 
 
-def _normalize_gpu_choice(value: object) -> str | None:
-    normalized = str(value or "").strip().lower()
-    return normalized or None
+def _normalize_gpu_count(value: object) -> int | None:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+    try:
+        return int(normalized)
+    except ValueError:
+        return None
+
+
+def _normalize_gpu_ids(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    normalized = str(value or "").strip()
+    if not normalized:
+        return []
+    return [item.strip() for item in normalized.split(",") if item.strip()]
 
 
 def _query_nvidia_smi_gpu_rows() -> tuple[list[dict[str, int]], str | None]:
@@ -560,20 +293,16 @@ def _compute_gpu_prompt_context() -> dict[str, Any]:
 
     context: dict[str, Any] = {
         "status": "blocked",
-        "policy": SINGLE_GPU_POLICY_NAME,
-        "default_gpu_choice": "auto",
-        "supported_gpu_choices": ["auto"],
-        "available_gpu_choices": [],
-        "recommended_gpu": None,
-        "reason": "GPU recommendation preflight not evaluated.",
+        "execution_model": "serial_controller_dispatch",
+        "supported_gpu_counts": ["1", "2"],
+        "available_gpu_ids": [],
+        "reason": "Manual GPU selection preflight not evaluated.",
         "blocker": None,
         "host_observation": {
             "cuda_visible_devices_env": visible_devices_raw,
             "visible_devices_entries": visible_devices,
             "required_gpu_index_env_key": DEFAULT_GPU_INDEX_ENV_KEY,
         },
-        "recommendation_trace": [],
-        "recommendation": None,
     }
 
     if visible_devices_raw is not None and not visible_devices:
@@ -585,10 +314,10 @@ def _compute_gpu_prompt_context() -> dict[str, Any]:
         return context
 
     try:
-        torch = importlib.import_module("torch")
+        torch = __import__("torch")
     except Exception as exc:
         context["blocker"] = f"GPU_PREFLIGHT_BLOCKED: unable to import `torch` for CUDA discovery: {exc}"
-        context["reason"] = "Cannot validate or recommend a GPU without torch CUDA discovery."
+        context["reason"] = "Cannot validate explicit GPU IDs without torch CUDA discovery."
         return context
 
     cuda_available = bool(torch.cuda.is_available())
@@ -601,57 +330,24 @@ def _compute_gpu_prompt_context() -> dict[str, Any]:
     )
 
     if not cuda_available or device_count < 1:
-        context["blocker"] = "GPU_PREFLIGHT_BLOCKED: no CUDA device is available to the controller (requested=auto)."
-        context["reason"] = "The controller will not pretend single-GPU scheduling succeeded on a no-GPU host."
+        context["blocker"] = "GPU_PREFLIGHT_BLOCKED: no CUDA device is available to the controller for explicit GPU selection."
+        context["reason"] = "The controller will not accept manual GPU IDs on a no-GPU host."
         return context
 
-    available_gpu_choices = visible_devices or [str(index) for index in range(device_count)]
-    context["available_gpu_choices"] = available_gpu_choices
-    context["supported_gpu_choices"] = ["auto", *available_gpu_choices]
+    available_gpu_ids = visible_devices or [str(index) for index in range(device_count)]
+    context["available_gpu_ids"] = available_gpu_ids
 
     smi_rows, smi_error = _query_nvidia_smi_gpu_rows()
-    available_gpu_set = set(available_gpu_choices)
+    available_gpu_set = set(available_gpu_ids)
     filtered_smi_rows = [row for row in smi_rows if str(row.get("index")) in available_gpu_set]
     context["host_observation"]["nvidia_smi_rows"] = smi_rows
     context["host_observation"]["nvidia_smi_error"] = smi_error
     context["host_observation"]["nvidia_smi_rows_considered"] = filtered_smi_rows
 
-    recommendation_trace = _as_string_list(context.get("recommendation_trace"))
-    if filtered_smi_rows:
-        recommended_gpu = str(filtered_smi_rows[0]["index"])
-        recommendation_source = "nvidia-smi least-busy GPU"
-        recommendation_reason = "Selected the least-used GPU reported by nvidia-smi among GPUs available to the controller."
-        recommendation_trace.append("selected least-used GPU from nvidia-smi")
-    elif visible_devices:
-        recommended_gpu = visible_devices[0]
-        recommendation_source = "CUDA_VISIBLE_DEVICES[first_visible]"
-        recommendation_reason = "nvidia-smi could not recommend an available GPU, so the first visible CUDA device was used."
-        recommendation_trace.append("selected first visible device from CUDA_VISIBLE_DEVICES")
-    else:
-        recommended_gpu = "0"
-        recommendation_source = "torch first visible GPU fallback"
-        recommendation_reason = "nvidia-smi was unavailable, so GPU 0 was used because torch confirmed visible CUDA devices."
-        recommendation_trace.append("fell back to GPU 0 because nvidia-smi was unavailable")
-
     context.update(
         {
             "status": "ready",
-            "default_gpu_choice": recommended_gpu,
-            "reason": "GPU recommendation is ready for the single-GPU execution policy.",
-            "recommendation_trace": recommendation_trace,
-            "recommended_gpu": {
-                "gpu": recommended_gpu,
-                "selection_source": recommendation_source,
-                "cuda_visible_devices": recommended_gpu,
-                "reason": recommendation_reason,
-            },
-            "recommendation": {
-                "gpu": recommended_gpu,
-                "selection_source": recommendation_source,
-                "cuda_visible_devices": recommended_gpu,
-                "reason": recommendation_reason,
-                "trace": recommendation_trace,
-            },
+            "reason": "Explicit GPU count and ordered GPU IDs can be validated for the controller's serial execution model.",
         }
     )
     return context
@@ -665,16 +361,16 @@ def _resolve_gpu_assignment(
     prompt_context = dict(gpu_prompt_context or _compute_gpu_prompt_context())
     assignment: dict[str, Any] = {
         "status": str(prompt_context.get("status") or "blocked"),
-        "policy": SINGLE_GPU_POLICY_NAME,
-        "available_gpu_choices": _as_string_list(prompt_context.get("available_gpu_choices")),
-        "supported_gpu_choices": _as_string_list(prompt_context.get("supported_gpu_choices")),
-        "default_gpu_choice": _normalize_gpu_choice(prompt_context.get("default_gpu_choice")) or "auto",
-        "requested_gpu_choice": _normalize_gpu_choice(workflow_request.get("gpu_choice")),
-        "requested_gpu_choice_source": "workflow_request.gpu_choice",
-        "requested_gpu_choice_defaulted": bool(workflow_request.get("gpu_choice_defaulted", False)),
-        "recommended_gpu": _as_dict(prompt_context.get("recommended_gpu")) or _as_dict(prompt_context.get("recommendation")),
-        "recommendation": _as_dict(prompt_context.get("recommendation")),
+        "execution_model": str(prompt_context.get("execution_model") or "serial_controller_dispatch"),
+        "available_gpu_ids": _as_string_list(prompt_context.get("available_gpu_ids")),
+        "supported_gpu_counts": _as_string_list(prompt_context.get("supported_gpu_counts")),
+        "requested_gpu_count": _normalize_gpu_count(
+            workflow_request.get("selected_gpu_count", workflow_request.get("gpu_count"))
+        ),
+        "requested_gpu_ids": _normalize_gpu_ids(workflow_request.get("selected_gpu_ids", workflow_request.get("gpu_ids"))),
         "selected_gpu": None,
+        "selected_gpu_count": None,
+        "selected_gpu_ids": [],
         "cuda_visible_devices": None,
         "reason": str(prompt_context.get("reason") or "GPU preflight not evaluated."),
         "blocker": prompt_context.get("blocker"),
@@ -685,52 +381,57 @@ def _resolve_gpu_assignment(
     if assignment["status"] != "ready":
         return assignment
 
-    available_gpu_choices = _as_string_list(assignment.get("available_gpu_choices"))
-    requested_gpu_choice = _normalize_gpu_choice(workflow_request.get("gpu_choice"))
-    requested_gpu_choice_defaulted = bool(workflow_request.get("gpu_choice_defaulted", False))
-    recommended_gpu = _as_dict(assignment.get("recommended_gpu"))
-    selected_gpu_payload: dict[str, Any]
+    available_gpu_ids = _as_string_list(assignment.get("available_gpu_ids"))
+    requested_gpu_count = assignment.get("requested_gpu_count")
+    requested_gpu_ids = _as_string_list(assignment.get("requested_gpu_ids"))
+    visible_devices_raw = assignment["host_observation"].get("cuda_visible_devices_env")
 
-    if requested_gpu_choice and requested_gpu_choice != "auto" and not requested_gpu_choice_defaulted:
-        if requested_gpu_choice not in available_gpu_choices:
-            visible_devices_raw = assignment["host_observation"].get("cuda_visible_devices_env")
-            assignment["status"] = "blocked"
-            assignment["blocker"] = (
-                "GPU_PREFLIGHT_BLOCKED: explicit GPU index "
-                f"{requested_gpu_choice} is not available to the controller"
-                + (f" under CUDA_VISIBLE_DEVICES={visible_devices_raw!r}." if visible_devices_raw is not None else ".")
-            )
-            assignment["reason"] = "The explicit GPU request conflicts with the controller-visible CUDA devices."
-            return assignment
-        assignment["selection_trace"] = ["using explicit workflow_request.gpu_choice"]
-        selected_gpu_payload = {
-            "gpu": requested_gpu_choice,
-            "selection_source": "workflow_request.gpu_choice",
-            "cuda_visible_devices": requested_gpu_choice,
-            "reason": "The user selected an explicit GPU, so it overrides the recommendation.",
-        }
-    else:
-        if not recommended_gpu:
-            assignment["status"] = "blocked"
-            assignment["blocker"] = "GPU_PREFLIGHT_BLOCKED: no recommended GPU was available for selection."
-            assignment["reason"] = "The controller could not convert the prompt recommendation into a runtime GPU assignment."
-            return assignment
-        trace_entry = (
-            "resolved auto GPU choice to recommendation"
-            if requested_gpu_choice == "auto" and not requested_gpu_choice_defaulted
-            else "used recommended/default GPU choice"
+    if requested_gpu_count not in (1, 2):
+        assignment["status"] = "blocked"
+        assignment["blocker"] = (
+            f"GPU_PREFLIGHT_BLOCKED: unsupported GPU count {requested_gpu_count!r}. Supported counts: 1, 2."
         )
-        assignment["selection_trace"] = [trace_entry]
-        selected_gpu_payload = {
-            "gpu": str(recommended_gpu.get("gpu") or ""),
-            "selection_source": str(recommended_gpu.get("selection_source") or "recommended/default"),
-            "cuda_visible_devices": str(recommended_gpu.get("cuda_visible_devices") or recommended_gpu.get("gpu") or ""),
-            "reason": str(recommended_gpu.get("reason") or "The recommended GPU was selected for execution."),
-        }
+        assignment["reason"] = "The runtime plan only supports explicit GPU counts of 1 or 2."
+        return assignment
 
-    assignment["selected_gpu"] = selected_gpu_payload
-    assignment["cuda_visible_devices"] = selected_gpu_payload["cuda_visible_devices"]
-    assignment["reason"] = "Single-GPU scheduling selected one deterministic CUDA device for all GPU-heavy phases."
+    if len(set(requested_gpu_ids)) != len(requested_gpu_ids):
+        assignment["status"] = "blocked"
+        assignment["blocker"] = f"GPU_PREFLIGHT_BLOCKED: duplicate GPU IDs are not allowed: {requested_gpu_ids}"
+        assignment["reason"] = "The runtime plan rejects duplicate GPU IDs so CUDA_VISIBLE_DEVICES stays coherent."
+        return assignment
+
+    if len(requested_gpu_ids) != requested_gpu_count:
+        assignment["status"] = "blocked"
+        assignment["blocker"] = (
+            "GPU_PREFLIGHT_BLOCKED: selected GPU count "
+            f"{requested_gpu_count} does not match explicit GPU IDs {requested_gpu_ids}."
+        )
+        assignment["reason"] = "The runtime plan requires the GPU count to match the explicit ordered GPU ID list."
+        return assignment
+
+    unavailable_gpu_ids = [gpu_id for gpu_id in requested_gpu_ids if gpu_id not in available_gpu_ids]
+    if unavailable_gpu_ids:
+        assignment["status"] = "blocked"
+        assignment["blocker"] = (
+            "GPU_PREFLIGHT_BLOCKED: explicit GPU ID(s) "
+            f"{unavailable_gpu_ids} are not available to the controller"
+            + (f" under CUDA_VISIBLE_DEVICES={visible_devices_raw!r}." if visible_devices_raw is not None else ".")
+        )
+        assignment["reason"] = "The explicit GPU IDs conflict with the controller-visible CUDA devices."
+        return assignment
+
+    selected_cuda_visible_devices = ",".join(requested_gpu_ids)
+    assignment["selection_trace"] = ["using explicit workflow_request.selected_gpu_ids in operator order"]
+    assignment["selected_gpu"] = {
+        "gpu": requested_gpu_ids[0],
+        "selection_source": "workflow_request.selected_gpu_ids[0]",
+        "cuda_visible_devices": selected_cuda_visible_devices,
+        "reason": "The first selected GPU ID is exported for compatibility while CUDA_VISIBLE_DEVICES preserves the full ordered list.",
+    }
+    assignment["selected_gpu_count"] = requested_gpu_count
+    assignment["selected_gpu_ids"] = requested_gpu_ids
+    assignment["cuda_visible_devices"] = selected_cuda_visible_devices
+    assignment["reason"] = "Explicit manual GPU selection was accepted for all GPU-heavy phases."
     return assignment
 
 
@@ -803,12 +504,10 @@ def _build_runtime_plan(
     controller_interpreter = _current_controller_interpreter_resolution()
     gpu_assignment = _resolve_gpu_assignment(workflow_request, gpu_prompt_context=gpu_prompt_context)
     runtime_estimate = _load_maniskill_runtime_estimate(str(workflow_request.get("selected_mode", "")))
-    requested_parallelism = bool(workflow_request.get("parallel_requested", False))
     integrated_workflow_blockers = _integrated_workflow_blockers(workflow_request)
     scheduling_reason = (
-        "GPU-heavy evaluation phases are serialized because Task 8 enforces an honest single-GPU v1 policy. "
-        "Only CPU/bootstrap/logging overlap would ever be considered safe, and this controller keeps workload launches serial "
-        "instead of faking concurrent GPU evaluation."
+        "GPU-heavy evaluation phases run serially under the direct Python controller. "
+        "The controller does not offer operator-facing parallel scheduling controls and does not claim concurrent GPU evaluation."
     )
 
     plan_items: list[dict[str, Any]] = []
@@ -830,26 +529,18 @@ def _build_runtime_plan(
                     blocker for blocker in integrated_workflow_blockers if blocker.get("workload_key") == workload_key
                 ],
                 "phases": {
-                    "bootstrap_cpu_overlap_allowed": bool(
-                        requested_parallelism and workload_key in MANAGED_OPENPI_POLICY_SERVER_WORKLOADS
-                    ),
+                    "bootstrap_cpu_overlap_allowed": False,
                     "gpu_heavy_execution": "serialized_single_gpu",
                     "gpu_heavy_phase_name": GPU_HEAVY_PHASE_NAME,
                     "logging_collection": "controller_managed",
                 },
-                "scheduler_notes": [
-                    "requested_parallelism_recorded" if requested_parallelism else "parallelism_not_requested",
-                    "gpu_heavy_phase_serialized_on_single_gpu",
-                ],
+                "scheduler_notes": ["operator-facing execution remains serial", "gpu_heavy_phase_serialized_on_single_gpu"],
             }
         )
 
     plan_payload = {
         "session_id": session_id,
         "status": "ready" if gpu_assignment.get("status") == "ready" and not integrated_workflow_blockers else "blocked",
-        "requested_parallelism": requested_parallelism,
-        "actual_parallelism": False,
-        "scheduler_policy": SINGLE_GPU_POLICY_NAME,
         "gpu_heavy_execution": "serialized_single_gpu",
         "scheduling_reason": scheduling_reason,
         "gpu_assignment": gpu_assignment,
@@ -871,13 +562,13 @@ def _build_runtime_plan(
 def _scheduler_execution_policy(runtime_plan: dict[str, Any]) -> dict[str, Any]:
     gpu_assignment = _as_dict(runtime_plan.get("gpu_assignment"))
     return {
-        "policy": SINGLE_GPU_POLICY_NAME,
-        "requested_parallelism": bool(runtime_plan.get("requested_parallelism", False)),
+        "execution_model": "serial_controller_dispatch",
         "actual_execution": "serialized_single_gpu_gpu_heavy_phases",
-        "actual_parallelism": bool(runtime_plan.get("actual_parallelism", False)),
         "gpu_heavy_execution": str(runtime_plan.get("gpu_heavy_execution", "serialized_single_gpu")),
         "reason": str(runtime_plan.get("scheduling_reason", "")),
         "selected_gpu": _as_dict(gpu_assignment.get("selected_gpu")) or None,
+        "selected_gpu_count": gpu_assignment.get("selected_gpu_count"),
+        "selected_gpu_ids": gpu_assignment.get("selected_gpu_ids"),
         "cuda_visible_devices": gpu_assignment.get("cuda_visible_devices"),
         "preflight_status": gpu_assignment.get("status"),
         "preflight_blocker": gpu_assignment.get("blocker"),
@@ -893,10 +584,13 @@ def _build_child_env(
     child_env = dict(os.environ)
     gpu_assignment = _as_dict(runtime_plan.get("gpu_assignment"))
     selected_gpu = _as_dict(gpu_assignment.get("selected_gpu"))
-    selected_cuda_visible_devices = str(selected_gpu.get("cuda_visible_devices", "")).strip()
+    selected_gpu_ids = _as_string_list(gpu_assignment.get("selected_gpu_ids"))
+    compatibility_gpu_index = str(selected_gpu.get("gpu", "")).strip()
+    selected_cuda_visible_devices = ",".join(selected_gpu_ids) or str(selected_gpu.get("cuda_visible_devices", "")).strip()
     if selected_cuda_visible_devices:
         child_env["CUDA_VISIBLE_DEVICES"] = selected_cuda_visible_devices
-        child_env[DEFAULT_GPU_INDEX_ENV_KEY] = selected_cuda_visible_devices
+    if compatibility_gpu_index:
+        child_env[DEFAULT_GPU_INDEX_ENV_KEY] = compatibility_gpu_index
     if managed_openpi_runtime is not None:
         policy_server_url = str(managed_openpi_runtime.get("policy_server_url", "")).strip()
         openpi_conda_env = str(managed_openpi_runtime.get("openpi_conda_env", "")).strip()
@@ -913,6 +607,157 @@ def _build_child_env(
     if openpi_checkpoint:
         child_env["OPENPI_CHECKPOINT"] = openpi_checkpoint
     return child_env
+
+
+def _controller_launch_metadata(
+    *,
+    workload_key: str,
+    workflow_request: dict[str, Any],
+    runtime_plan: dict[str, Any],
+    launch_path: str,
+    effective_workload_python: str | None = None,
+) -> dict[str, Any]:
+    workload_details = _as_dict(_as_dict(workflow_request.get("workload_details")).get(workload_key))
+    gpu_assignment = _as_dict(runtime_plan.get("gpu_assignment"))
+    controller_interpreter = _current_controller_interpreter_resolution()
+    return {
+        "timestamp": iso_timestamp(),
+        "launch_path": launch_path,
+        "workload_key": workload_key,
+        "benchmark": str(workload_details.get("benchmark", "")),
+        "model_family": str(workload_details.get("model_family", "")),
+        "controller_python": str(controller_interpreter.get("selected_python") or sys.executable),
+        "effective_workload_python": effective_workload_python,
+        "selected_gpu_count": gpu_assignment.get("selected_gpu_count"),
+        "selected_gpu_ids": _as_string_list(gpu_assignment.get("selected_gpu_ids")),
+    }
+
+
+def _append_subprocess_output(log_path: Path, output_text: str) -> None:
+    if not output_text:
+        return
+    with log_path.open("a") as f:
+        if not output_text.endswith("\n"):
+            output_text = f"{output_text}\n"
+        f.write(output_text)
+
+
+def _write_controller_event(controller_log_path: Path, payload: dict[str, Any], *, heading: str) -> None:
+    append_breadcrumb_block(controller_log_path, payload, heading=heading)
+
+
+@contextmanager
+def _temporary_env(updates: dict[str, str]) -> Any:
+    previous: dict[str, str | None] = {}
+    try:
+        for key, value in updates.items():
+            previous[key] = os.environ.get(key)
+            os.environ[key] = value
+        yield
+    finally:
+        for key, old_value in previous.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
+
+
+def _apply_workload_child_env(child_env: dict[str, str], launch_metadata: dict[str, Any], *, workload_key: str) -> dict[str, str]:
+    child_env[WORKFLOW_LAUNCH_PATH_ENV_KEY] = str(launch_metadata.get("launch_path") or "controller_subprocess")
+    child_env[WORKFLOW_WORKLOAD_KEY_ENV_KEY] = str(launch_metadata.get("workload_key") or workload_key)
+    child_env[WORKFLOW_BENCHMARK_ENV_KEY] = str(launch_metadata.get("benchmark") or "")
+    child_env[WORKFLOW_MODEL_FAMILY_ENV_KEY] = str(launch_metadata.get("model_family") or "")
+    child_env[WORKFLOW_CONTROLLER_PYTHON_ENV_KEY] = str(launch_metadata.get("controller_python") or sys.executable)
+    child_env[WORKFLOW_SELECTED_GPU_COUNT_ENV_KEY] = str(launch_metadata.get("selected_gpu_count") or "")
+    child_env[WORKFLOW_SELECTED_GPU_IDS_ENV_KEY] = ",".join(_as_string_list(launch_metadata.get("selected_gpu_ids")))
+    return child_env
+
+
+def _build_execution_record(
+    *,
+    workload_key: str,
+    command: list[str],
+    log_path: Path,
+    started_at: float,
+    finished_at: float,
+    status: str,
+    exit_code: int,
+    parsed_stdout: dict[str, Any],
+    failure_details: dict[str, Any],
+    policy_server: dict[str, Any] | None,
+    launch_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "timestamp": iso_timestamp(),
+        "launch_path": launch_metadata.get("launch_path"),
+        "workload_key": workload_key,
+        "benchmark": launch_metadata.get("benchmark"),
+        "model_family": launch_metadata.get("model_family"),
+        "controller_python": launch_metadata.get("controller_python"),
+        "effective_workload_python": parsed_stdout.get("effective_workload_python") or launch_metadata.get("effective_workload_python"),
+        "selected_gpu_count": launch_metadata.get("selected_gpu_count"),
+        "selected_gpu_ids": launch_metadata.get("selected_gpu_ids"),
+        "failure_phase": failure_details.get("failure_phase"),
+        "failure_location": failure_details.get("failure_location"),
+        "exception_type": failure_details.get("exception_type"),
+        "exception_message": failure_details.get("exception_message"),
+        "traceback_tail": failure_details.get("traceback_tail"),
+        "subprocess_detail": failure_details.get("subprocess_detail"),
+        "command": command,
+        "cwd": str(REPO_ROOT),
+        "started_at_unix": started_at,
+        "finished_at_unix": finished_at,
+        "duration_seconds": finished_at - started_at,
+        "status": status,
+        "exit_code": exit_code,
+        "parsed_stdout": parsed_stdout,
+        "log_path": str(log_path),
+        "policy_server": policy_server,
+    }
+
+
+def _controller_child_result(
+    *,
+    workload_key: str,
+    status: str,
+    exit_code: int,
+    command: list[str],
+    log_path: Path,
+    execution_record_path: Path,
+    parsed_stdout: dict[str, Any],
+    failure_details: dict[str, Any],
+    policy_server: dict[str, Any] | None,
+    launch_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "workload_key": workload_key,
+        "status": status,
+        "exit_code": exit_code,
+        "blocker_reason": failure_details.get("exception_message"),
+        "failure_phase": failure_details.get("failure_phase"),
+        "failure_location": failure_details.get("failure_location"),
+        "exception_type": failure_details.get("exception_type"),
+        "exception_message": failure_details.get("exception_message"),
+        "traceback_tail": failure_details.get("traceback_tail"),
+        "launch_path": launch_metadata.get("launch_path"),
+        "controller_python": launch_metadata.get("controller_python"),
+        "effective_workload_python": parsed_stdout.get("effective_workload_python") or launch_metadata.get("effective_workload_python"),
+        "selected_gpu_count": launch_metadata.get("selected_gpu_count"),
+        "selected_gpu_ids": launch_metadata.get("selected_gpu_ids"),
+        "command": command,
+        "summary_path": parsed_stdout.get("summary_path") or None,
+        "manifest_path": parsed_stdout.get("manifest_path") or None,
+        "episodes_path": parsed_stdout.get("episodes_path") or None,
+        "run_dir": parsed_stdout.get("run_dir") or None,
+        "checkpoint": None,
+        "average_success_rate": None,
+        "per_task_success_rate": {},
+        "artifact_paths": {},
+        "log_path": str(log_path),
+        "parsed_stdout": parsed_stdout,
+        "execution_record_path": str(execution_record_path),
+        "policy_server": policy_server,
+    }
 
 
 def _resolve_child_artifact_root(workflow_request: dict[str, Any], workload_key: str) -> str:
@@ -959,13 +804,12 @@ def _emit_plan_preview(
     preview_payload = {
         "status": runtime_plan.get("status"),
         "selected_mode": workflow_request.get("selected_mode"),
-        "parallel_requested": workflow_request.get("parallel_requested"),
         "artifact_root_overridden": workflow_request.get("artifact_root_overridden"),
         "requested_artifact_root": workflow_request.get("artifact_root"),
-        "scheduler_policy": runtime_plan.get("scheduler_policy"),
         "gpu_heavy_execution": runtime_plan.get("gpu_heavy_execution"),
-        "available_gpu_choices": gpu_assignment.get("available_gpu_choices"),
-        "recommended_gpu": gpu_assignment.get("recommended_gpu"),
+        "available_gpu_ids": gpu_assignment.get("available_gpu_ids"),
+        "selected_gpu_count": gpu_assignment.get("selected_gpu_count"),
+        "selected_gpu_ids": gpu_assignment.get("selected_gpu_ids"),
         "selected_gpu": gpu_assignment.get("selected_gpu"),
         "gpu_assignment": gpu_assignment,
         "workflow_blockers": runtime_plan.get("workflow_blockers"),
@@ -1003,87 +847,120 @@ def _resolve_openpi_policy_config(checkpoint: str) -> str:
     return candidate or DEFAULT_OPENPI_POLICY_CONFIG
 
 
-def _maniskill_openpi_runtime_args() -> list[str]:
-    runtime_args: list[str] = []
-    policy_server_url = _resolve_openpi_policy_server_url()
-    openpi_conda_env = _resolve_openpi_conda_env()
-    openpi_repo_root = _resolve_openpi_repo_root()
-    if policy_server_url:
-        runtime_args.extend(["--pi0_policy_server_url", policy_server_url])
-    if openpi_conda_env:
-        runtime_args.extend(["--openpi_conda_env", openpi_conda_env])
-    if openpi_repo_root:
-        runtime_args.extend(["--openpi_repo_root", openpi_repo_root])
-    return runtime_args
+def _resolve_openpi_bootstrap_python() -> str:
+    controller_interpreter = _current_controller_interpreter_resolution()
+    return str(controller_interpreter.get("selected_python") or sys.executable)
+
+
+def _openpi_lifecycle_metadata(
+    *,
+    workload_key: str,
+    checkpoint: str,
+    phase: str,
+    policy_server_url: str,
+    bootstrap_command: list[str] | None = None,
+    bootstrap_metadata: dict[str, str] | None = None,
+    policy_server_command: list[str] | None = None,
+    error_message: str | None = None,
+    teardown_reason: str | None = None,
+    teardown_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    controller_interpreter = _current_controller_interpreter_resolution()
+    bootstrap_metadata = bootstrap_metadata or {}
+    payload: dict[str, Any] = {
+        "timestamp": iso_timestamp(),
+        "launch_path": "controller_managed_openpi",
+        "workload_key": workload_key,
+        "controller_python": str(controller_interpreter.get("selected_python") or sys.executable),
+        "effective_workload_python": str(bootstrap_metadata.get("openpi_policy_server_python") or ""),
+        "openpi_phase": phase,
+        "openpi_checkpoint": checkpoint,
+        "openpi_policy_server_url": policy_server_url,
+        "openpi_conda_env": str(bootstrap_metadata.get("openpi_conda_env") or _resolve_openpi_conda_env()),
+        "openpi_repo_root": str(bootstrap_metadata.get("openpi_repo_root") or _resolve_openpi_repo_root()),
+        "openpi_bootstrap_python": str(
+            bootstrap_metadata.get("openpi_bootstrap_python")
+            or (bootstrap_command[0] if bootstrap_command else _resolve_openpi_bootstrap_python())
+        ),
+    }
+    if bootstrap_command:
+        payload["openpi_bootstrap_command"] = shlex.join(bootstrap_command)
+    if policy_server_command:
+        payload["openpi_policy_server_command"] = shlex.join(policy_server_command)
+    if bootstrap_metadata.get("openpi_policy_server_entrypoint"):
+        payload["openpi_policy_server_entrypoint"] = bootstrap_metadata["openpi_policy_server_entrypoint"]
+    if bootstrap_metadata.get("openpi_policy_server_launch_prefix"):
+        payload["openpi_policy_server_launch_prefix"] = bootstrap_metadata["openpi_policy_server_launch_prefix"]
+    if error_message:
+        payload["exception_message"] = error_message
+    if teardown_reason:
+        payload["openpi_stop_reason"] = teardown_reason
+    if teardown_result is not None:
+        payload["openpi_teardown_result"] = json.dumps(teardown_result, sort_keys=True, default=_json_default)
+    return payload
+
+
+def _append_openpi_lifecycle_event(
+    *,
+    log_path: Path,
+    lifecycle_events: list[dict[str, Any]],
+    workload_key: str,
+    checkpoint: str,
+    phase: str,
+    policy_server_url: str,
+    bootstrap_command: list[str] | None = None,
+    bootstrap_metadata: dict[str, str] | None = None,
+    policy_server_command: list[str] | None = None,
+    error_message: str | None = None,
+    teardown_reason: str | None = None,
+    teardown_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = _openpi_lifecycle_metadata(
+        workload_key=workload_key,
+        checkpoint=checkpoint,
+        phase=phase,
+        policy_server_url=policy_server_url,
+        bootstrap_command=bootstrap_command,
+        bootstrap_metadata=bootstrap_metadata,
+        policy_server_command=policy_server_command,
+        error_message=error_message,
+        teardown_reason=teardown_reason,
+        teardown_result=teardown_result,
+    )
+    append_breadcrumb_block(log_path, payload, heading=phase)
+    lifecycle_events.append(payload)
+    return payload
+
+
+def _openpi_teardown_result(*, process_started: bool, result: dict[str, Any] | None = None) -> dict[str, Any]:
+    if result is None:
+        return {
+            "process_started": process_started,
+            "terminated": False,
+            "kill_used": False,
+            "returncode": None,
+        }
+    return {"process_started": process_started, **result}
 
 
 def _build_command(
     workflow_request: dict[str, Any],
     workload_key: str,
     session_id: str,
-    *,
-    managed_openpi_runtime: dict[str, str] | None = None,
 ) -> list[str]:
-    workload_details = workflow_request["workload_details"][workload_key]
-    model_family = str(workload_details["model_family"])
-    checkpoint = str(workflow_request["checkpoint_map"][workload_key])
-    artifact_root = _resolve_child_artifact_root(workflow_request, workload_key)
-    run_id_note = f"{session_id}--{workload_key}"
-
     if workload_key in MANISKILL_WORKLOADS:
-        command = [
-            "python3",
-            "experiments/robot/maniskill/run_maniskill_eval.py",
-            "--model_family",
-            model_family,
-            "--mode",
-            str(workflow_request["maniskill_mode"]),
-            "--episodes_per_task",
-            str(workflow_request["maniskill_episodes_per_task"]),
-            "--artifact_root",
-            artifact_root,
-            "--run_id_note",
-            run_id_note,
-        ]
-        if model_family == "pi0":
-            command.extend(["--openpi_checkpoint", checkpoint])
-            if managed_openpi_runtime is not None:
-                command.extend(["--pi0_policy_server_url", managed_openpi_runtime["policy_server_url"]])
-                command.extend(["--openpi_conda_env", managed_openpi_runtime["openpi_conda_env"]])
-                command.extend(["--openpi_repo_root", managed_openpi_runtime["openpi_repo_root"]])
-            else:
-                command.extend(_maniskill_openpi_runtime_args())
-        else:
-            command.extend(["--pretrained_checkpoint", checkpoint])
-        return command
+        raise ValueError(f"MANISKILL_INPROCESS_REQUIRED: {workload_key}")
 
     if workload_key in LIBERO_WORKLOADS:
-        return [
-            "python3",
-            "experiments/robot/libero/run_libero_eval.py",
-            "--model_family",
-            model_family,
-            "--pretrained_checkpoint",
-            checkpoint,
-            "--task_suite_name",
-            str(workflow_request["libero_task_suite_name"]),
-            "--num_trials_per_task",
-            str(workflow_request["libero_num_trials_per_task"]),
-            "--use_wandb",
-            "False",
-            "--artifact_root",
-            artifact_root,
-            "--run_id_note",
-            run_id_note,
-        ]
+        raise ValueError(f"LIBERO_INPROCESS_REQUIRED: {workload_key}")
 
     raise ValueError(f"UNSUPPORTED_WORKLOAD: {workload_key}")
 
 
 def _build_openpi_bootstrap_command(*, checkpoint: str, policy_server_url: str, require_policy_server_health: bool) -> list[str]:
     command = [
-        "python3",
-        "experiments/robot/maniskill/bootstrap_openpi.py",
+        _resolve_openpi_bootstrap_python(),
+        str((REPO_ROOT / "experiments/robot/maniskill/bootstrap_openpi.py").resolve()),
         "--checkpoint",
         checkpoint,
         "--policy-server-url",
@@ -1205,12 +1082,28 @@ def _start_managed_openpi_policy_server(
     workload_key: str,
     checkpoint: str,
     workload_dir: Path,
+    log_path: Path,
     env: dict[str, str] | None,
 ) -> dict[str, Any]:
     bootstrap_log_path = workload_dir / "policy_server_bootstrap.log"
     health_log_path = workload_dir / "policy_server_health.log"
     server_log_path = workload_dir / "policy_server.log"
     policy_server_url = _resolve_openpi_policy_server_url()
+    lifecycle_events: list[dict[str, Any]] = []
+    bootstrap_command = _build_openpi_bootstrap_command(
+        checkpoint=checkpoint,
+        policy_server_url=policy_server_url,
+        require_policy_server_health=False,
+    )
+    _append_openpi_lifecycle_event(
+        log_path=log_path,
+        lifecycle_events=lifecycle_events,
+        workload_key=workload_key,
+        checkpoint=checkpoint,
+        phase="openpi_start",
+        policy_server_url=policy_server_url,
+        bootstrap_command=bootstrap_command,
+    )
     bootstrap_exit_code, bootstrap_output, bootstrap_metadata = _run_openpi_bootstrap_command(
         checkpoint=checkpoint,
         policy_server_url=policy_server_url,
@@ -1220,11 +1113,96 @@ def _start_managed_openpi_policy_server(
     )
     if bootstrap_exit_code != 0 or bootstrap_metadata.get("openpi_runtime_status") != "ready":
         message = _tail_nonempty_line(bootstrap_output)
-        raise RuntimeError(message or "OPENPI_BOOTSTRAP_ERROR: unable to prepare managed OpenPI runtime.")
+        stop_payload = _append_openpi_lifecycle_event(
+            log_path=log_path,
+            lifecycle_events=lifecycle_events,
+            workload_key=workload_key,
+            checkpoint=checkpoint,
+            phase="openpi_stop",
+            policy_server_url=policy_server_url,
+            bootstrap_command=bootstrap_command,
+            bootstrap_metadata=bootstrap_metadata,
+            error_message=message,
+            teardown_reason="bootstrap_failed",
+            teardown_result=_openpi_teardown_result(process_started=False),
+        )
+        raise ManagedOpenPILifecycleError(
+            message or "OPENPI_BOOTSTRAP_ERROR: unable to prepare managed OpenPI runtime.",
+            failure_phase="openpi_bootstrap",
+            payload={
+                "state": "bootstrap_failed",
+                "error_message": message or "OPENPI_BOOTSTRAP_ERROR: unable to prepare managed OpenPI runtime.",
+                "failure_location": str(bootstrap_log_path),
+                "traceback_tail": message or "OPENPI_BOOTSTRAP_ERROR: unable to prepare managed OpenPI runtime.",
+                "policy_server_url": policy_server_url,
+                "openpi_conda_env": bootstrap_metadata.get("openpi_conda_env") or _resolve_openpi_conda_env(),
+                "openpi_repo_root": bootstrap_metadata.get("openpi_repo_root") or _resolve_openpi_repo_root(),
+                "checkpoint": checkpoint,
+                "bootstrap_log_path": str(bootstrap_log_path),
+                "health_log_path": str(health_log_path),
+                "server_log_path": str(server_log_path),
+                "bootstrap_metadata": bootstrap_metadata,
+                "command": bootstrap_command,
+                "lifecycle_events": lifecycle_events,
+                "teardown": {
+                    "reason": "bootstrap_failed",
+                    "bootstrap_log_path": str(bootstrap_log_path),
+                    "health_log_path": str(health_log_path),
+                    "server_log_path": str(server_log_path),
+                    "command": bootstrap_command,
+                    "result": _openpi_teardown_result(process_started=False),
+                    "event": stop_payload,
+                },
+            },
+        )
 
-    command = _build_openpi_policy_server_command(bootstrap_metadata)
+    try:
+        command = _build_openpi_policy_server_command(bootstrap_metadata)
+    except Exception as exc:
+        error_message = str(exc).strip() or "OPENPI_POLICY_SERVER_STARTUP_FAILED"
+        stop_payload = _append_openpi_lifecycle_event(
+            log_path=log_path,
+            lifecycle_events=lifecycle_events,
+            workload_key=workload_key,
+            checkpoint=checkpoint,
+            phase="openpi_stop",
+            policy_server_url=policy_server_url,
+            bootstrap_command=bootstrap_command,
+            bootstrap_metadata=bootstrap_metadata,
+            error_message=error_message,
+            teardown_reason="startup_failed",
+            teardown_result=_openpi_teardown_result(process_started=False),
+        )
+        raise ManagedOpenPILifecycleError(
+            error_message,
+            failure_phase="openpi_policy_server_startup",
+            payload={
+                "state": "startup_failed",
+                "error_message": error_message,
+                "failure_location": str(bootstrap_log_path),
+                "traceback_tail": error_message,
+                "policy_server_url": policy_server_url,
+                "openpi_conda_env": bootstrap_metadata.get("openpi_conda_env", ""),
+                "openpi_repo_root": bootstrap_metadata.get("openpi_repo_root", ""),
+                "checkpoint": checkpoint,
+                "bootstrap_log_path": str(bootstrap_log_path),
+                "health_log_path": str(health_log_path),
+                "server_log_path": str(server_log_path),
+                "bootstrap_metadata": bootstrap_metadata,
+                "command": bootstrap_command,
+                "lifecycle_events": lifecycle_events,
+                "teardown": {
+                    "reason": "startup_failed",
+                    "bootstrap_log_path": str(bootstrap_log_path),
+                    "health_log_path": str(health_log_path),
+                    "server_log_path": str(server_log_path),
+                    "command": bootstrap_command,
+                    "result": _openpi_teardown_result(process_started=False),
+                    "event": stop_payload,
+                },
+            },
+        ) from exc
     repo_root = Path(bootstrap_metadata["openpi_repo_root"]).resolve()
-    print(f"policy_server_lifecycle=start:{workload_key}:{policy_server_url}")
     log_handle = server_log_path.open("w")
     try:
         process = subprocess.Popen(
@@ -1235,9 +1213,64 @@ def _start_managed_openpi_policy_server(
             stderr=subprocess.STDOUT,
             text=True,
         )
-    except Exception:
+    except Exception as exc:
         log_handle.close()
-        raise
+        error_message = str(exc).strip() or "OPENPI_POLICY_SERVER_STARTUP_FAILED"
+        stop_payload = _append_openpi_lifecycle_event(
+            log_path=log_path,
+            lifecycle_events=lifecycle_events,
+            workload_key=workload_key,
+            checkpoint=checkpoint,
+            phase="openpi_stop",
+            policy_server_url=policy_server_url,
+            bootstrap_command=bootstrap_command,
+            bootstrap_metadata=bootstrap_metadata,
+            policy_server_command=command,
+            error_message=error_message,
+            teardown_reason="startup_failed",
+            teardown_result=_openpi_teardown_result(process_started=False),
+        )
+        raise ManagedOpenPILifecycleError(
+            error_message,
+            failure_phase="openpi_policy_server_startup",
+            payload={
+                "state": "startup_failed",
+                "error_message": error_message,
+                "failure_location": str(server_log_path),
+                "traceback_tail": error_message,
+                "policy_server_url": policy_server_url,
+                "openpi_conda_env": bootstrap_metadata.get("openpi_conda_env", ""),
+                "openpi_repo_root": bootstrap_metadata.get("openpi_repo_root", ""),
+                "checkpoint": checkpoint,
+                "bootstrap_log_path": str(bootstrap_log_path),
+                "health_log_path": str(health_log_path),
+                "server_log_path": str(server_log_path),
+                "bootstrap_metadata": bootstrap_metadata,
+                "command": command,
+                "lifecycle_events": lifecycle_events,
+                "teardown": {
+                    "reason": "startup_failed",
+                    "bootstrap_log_path": str(bootstrap_log_path),
+                    "health_log_path": str(health_log_path),
+                    "server_log_path": str(server_log_path),
+                    "command": command,
+                    "result": _openpi_teardown_result(process_started=False),
+                    "event": stop_payload,
+                },
+            },
+        ) from exc
+
+    _append_openpi_lifecycle_event(
+        log_path=log_path,
+        lifecycle_events=lifecycle_events,
+        workload_key=workload_key,
+        checkpoint=checkpoint,
+        phase="openpi_healthcheck_begin",
+        policy_server_url=policy_server_url,
+        bootstrap_command=bootstrap_command,
+        bootstrap_metadata=bootstrap_metadata,
+        policy_server_command=command,
+    )
 
     healthy, health_output, health_metadata = _wait_for_openpi_policy_server_health(
         checkpoint=checkpoint,
@@ -1247,19 +1280,83 @@ def _start_managed_openpi_policy_server(
         env=env,
     )
     if not healthy:
-        _ = _terminate_process(process)
+        teardown_result = _openpi_teardown_result(process_started=True, result=_terminate_process(process))
         log_handle.close()
-        print(f"policy_server_lifecycle=startup_failed:{workload_key}:{policy_server_url}")
-        print(f"policy_server_lifecycle=teardown:{workload_key}:startup_failed")
         details = _tail_nonempty_line(health_output)
-        if server_log_path.exists() and not details:
+        if server_log_path.exists() and (not details or details == "no_output"):
             details = _tail_nonempty_line(server_log_path.read_text())
-        raise RuntimeError(
+        error_message = (
             details
             or "OPENPI_POLICY_SERVER_STARTUP_FAILED: managed policy server failed health validation before child launch."
         )
+        _append_openpi_lifecycle_event(
+            log_path=log_path,
+            lifecycle_events=lifecycle_events,
+            workload_key=workload_key,
+            checkpoint=checkpoint,
+            phase="openpi_healthcheck_fail",
+            policy_server_url=policy_server_url,
+            bootstrap_command=bootstrap_command,
+            bootstrap_metadata=bootstrap_metadata,
+            policy_server_command=command,
+            error_message=error_message,
+        )
+        stop_payload = _append_openpi_lifecycle_event(
+            log_path=log_path,
+            lifecycle_events=lifecycle_events,
+            workload_key=workload_key,
+            checkpoint=checkpoint,
+            phase="openpi_stop",
+            policy_server_url=policy_server_url,
+            bootstrap_command=bootstrap_command,
+            bootstrap_metadata=bootstrap_metadata,
+            policy_server_command=command,
+            error_message=error_message,
+            teardown_reason="startup_failed",
+            teardown_result=teardown_result,
+        )
+        raise ManagedOpenPILifecycleError(
+            error_message,
+            failure_phase="openpi_healthcheck_fail",
+            payload={
+                "state": "startup_failed",
+                "error_message": error_message,
+                "failure_location": str(health_log_path),
+                "traceback_tail": error_message,
+                "policy_server_url": policy_server_url,
+                "openpi_conda_env": bootstrap_metadata.get("openpi_conda_env", ""),
+                "openpi_repo_root": bootstrap_metadata.get("openpi_repo_root", ""),
+                "checkpoint": checkpoint,
+                "bootstrap_log_path": str(bootstrap_log_path),
+                "health_log_path": str(health_log_path),
+                "server_log_path": str(server_log_path),
+                "bootstrap_metadata": bootstrap_metadata,
+                "health_metadata": health_metadata,
+                "command": command,
+                "lifecycle_events": lifecycle_events,
+                "teardown": {
+                    "reason": "startup_failed",
+                    "bootstrap_log_path": str(bootstrap_log_path),
+                    "health_log_path": str(health_log_path),
+                    "server_log_path": str(server_log_path),
+                    "command": command,
+                    "result": teardown_result,
+                    "event": stop_payload,
+                },
+            },
+        )
 
-    print(f"policy_server_lifecycle=healthy:{workload_key}:{policy_server_url}")
+    _append_openpi_lifecycle_event(
+        log_path=log_path,
+        lifecycle_events=lifecycle_events,
+        workload_key=workload_key,
+        checkpoint=checkpoint,
+        phase="openpi_healthcheck_pass",
+        policy_server_url=policy_server_url,
+        bootstrap_command=bootstrap_command,
+        bootstrap_metadata=bootstrap_metadata,
+        policy_server_command=command,
+    )
     return {
         "process": process,
         "log_handle": log_handle,
@@ -1273,6 +1370,9 @@ def _start_managed_openpi_policy_server(
         "server_log_path": str(server_log_path),
         "bootstrap_metadata": bootstrap_metadata,
         "health_metadata": health_metadata,
+        "lifecycle_events": lifecycle_events,
+        "log_path": str(log_path),
+        "bootstrap_command": bootstrap_command,
     }
 
 
@@ -1284,10 +1384,23 @@ def _teardown_managed_openpi_policy_server(workload_key: str, runtime: dict[str,
     process = runtime.get("process")
     teardown_result: dict[str, Any] | None = None
     if isinstance(process, subprocess.Popen):
-        teardown_result = _terminate_process(process)
+        teardown_result = _openpi_teardown_result(process_started=True, result=_terminate_process(process))
     if log_handle is not None:
         log_handle.close()
-    print(f"policy_server_lifecycle=teardown:{workload_key}:{reason}")
+    lifecycle_events = runtime.setdefault("lifecycle_events", [])
+    stop_event = _append_openpi_lifecycle_event(
+        log_path=Path(str(runtime.get("log_path") or runtime.get("server_log_path") or "")),
+        lifecycle_events=lifecycle_events,
+        workload_key=workload_key,
+        checkpoint=str(runtime.get("checkpoint") or ""),
+        phase="openpi_stop",
+        policy_server_url=str(runtime.get("policy_server_url") or _resolve_openpi_policy_server_url()),
+        bootstrap_command=runtime.get("bootstrap_command"),
+        bootstrap_metadata=dict(runtime.get("bootstrap_metadata") or {}),
+        policy_server_command=runtime.get("command"),
+        teardown_reason=reason,
+        teardown_result=teardown_result or _openpi_teardown_result(process_started=False),
+    )
     return {
         "reason": reason,
         "bootstrap_log_path": runtime.get("bootstrap_log_path"),
@@ -1295,6 +1408,7 @@ def _teardown_managed_openpi_policy_server(workload_key: str, runtime: dict[str,
         "server_log_path": runtime.get("server_log_path"),
         "command": runtime.get("command"),
         "result": teardown_result,
+        "event": stop_event,
     }
 
 
@@ -1304,6 +1418,7 @@ def _build_policy_server_payload(
     state: str,
     teardown: dict[str, Any] | None = None,
     error_message: str | None = None,
+    lifecycle_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     if runtime is None and teardown is None and error_message is None:
         return None
@@ -1311,6 +1426,7 @@ def _build_policy_server_payload(
         "state": state,
         "error_message": error_message,
         "teardown": teardown,
+        "lifecycle_events": lifecycle_events or [],
     }
     if runtime is not None:
         payload.update(
@@ -1323,6 +1439,7 @@ def _build_policy_server_payload(
                 "health_log_path": runtime.get("health_log_path"),
                 "server_log_path": runtime.get("server_log_path"),
                 "command": runtime.get("command"),
+                "bootstrap_command": runtime.get("bootstrap_command"),
                 "bootstrap_metadata": runtime.get("bootstrap_metadata"),
                 "health_metadata": runtime.get("health_metadata"),
             }
@@ -1339,42 +1456,38 @@ def _failed_execution_result(
     started_at: float,
     error_message: str,
     policy_server: dict[str, Any] | None,
+    launch_metadata: dict[str, Any],
+    failure_details: dict[str, Any],
 ) -> dict[str, Any]:
     finished_at = time.time()
-    execution_record = {
-        "workload_key": workload_key,
-        "command": command,
-        "cwd": str(REPO_ROOT),
-        "started_at_unix": started_at,
-        "finished_at_unix": finished_at,
-        "duration_seconds": finished_at - started_at,
-        "status": "failed",
-        "exit_code": 1,
-        "parsed_stdout": {},
-        "error": error_message,
-        "log_path": str(log_path),
-        "policy_server": policy_server,
-    }
+    execution_record = _build_execution_record(
+        workload_key=workload_key,
+        command=command,
+        log_path=log_path,
+        started_at=started_at,
+        finished_at=finished_at,
+        status="failed",
+        exit_code=1,
+        parsed_stdout={},
+        failure_details=failure_details,
+        policy_server=policy_server,
+        launch_metadata=launch_metadata,
+    )
     _write_json(execution_record_path, execution_record)
-    return {
-        "workload_key": workload_key,
-        "status": "failed",
-        "exit_code": 1,
-        "blocker_reason": error_message,
-        "command": command,
-        "summary_path": None,
-        "manifest_path": None,
-        "episodes_path": None,
-        "run_dir": None,
-        "checkpoint": None,
-        "average_success_rate": None,
-        "per_task_success_rate": {},
-        "artifact_paths": {},
-        "log_path": str(log_path),
-        "parsed_stdout": {},
-        "execution_record_path": str(execution_record_path),
-        "policy_server": policy_server,
-    }
+    child = _controller_child_result(
+        workload_key=workload_key,
+        status="failed",
+        exit_code=1,
+        command=command,
+        log_path=log_path,
+        execution_record_path=execution_record_path,
+        parsed_stdout={},
+        failure_details=failure_details,
+        policy_server=policy_server,
+        launch_metadata=launch_metadata,
+    )
+    child["blocker_reason"] = error_message
+    return child
 
 
 def _parse_child_result(*, workload_key: str, command: list[str], output_text: str, exit_code: int, log_path: Path) -> dict[str, Any]:
@@ -1389,6 +1502,7 @@ def _parse_child_result(*, workload_key: str, command: list[str], output_text: s
     artifact_paths: dict[str, Any] = {}
     per_task_success_rate: dict[str, Any] = {}
     blocker_reason = None
+    subprocess_detail = shlex.join(command)
 
     if parsed_stdout.get("average_success_rate"):
         try:
@@ -1420,12 +1534,32 @@ def _parse_child_result(*, workload_key: str, command: list[str], output_text: s
 
     if exit_code == 0 and summary_path:
         status = "complete"
+        failure_details = {
+            "failure_phase": None,
+            "failure_location": None,
+            "exception_type": None,
+            "exception_message": None,
+            "traceback_tail": None,
+            "subprocess_detail": subprocess_detail,
+        }
     elif exit_code == 0:
         status = "failed"
         blocker_reason = "missing_summary_path_from_child_stdout"
+        failure_details = failure_metadata_from_output(
+            output_text,
+            failure_phase="child_summary_validation",
+            subprocess_detail=subprocess_detail,
+            fallback_exception_message=blocker_reason,
+        )
     else:
         status = "failed"
         blocker_reason = _tail_nonempty_line(output_text)
+        failure_details = failure_metadata_from_output(
+            output_text,
+            failure_phase="child_subprocess_execution",
+            subprocess_detail=subprocess_detail,
+            fallback_exception_message=blocker_reason,
+        )
 
     return {
         "workload_key": workload_key,
@@ -1443,6 +1577,232 @@ def _parse_child_result(*, workload_key: str, command: list[str], output_text: s
         "artifact_paths": artifact_paths,
         "log_path": str(log_path),
         "parsed_stdout": parsed_stdout,
+        "failure_phase": parsed_stdout.get("failure_phase") or failure_details.get("failure_phase"),
+        "failure_location": parsed_stdout.get("failure_location") or failure_details.get("failure_location"),
+        "exception_type": parsed_stdout.get("exception_type") or failure_details.get("exception_type"),
+        "exception_message": parsed_stdout.get("exception_message") or failure_details.get("exception_message"),
+        "traceback_tail": parsed_stdout.get("traceback_tail") or failure_details.get("traceback_tail"),
+        "subprocess_detail": failure_details.get("subprocess_detail"),
+        "launch_path": parsed_stdout.get("launch_path") or None,
+        "controller_python": parsed_stdout.get("controller_python") or None,
+        "effective_workload_python": parsed_stdout.get("effective_workload_python") or None,
+        "selected_gpu_count": parsed_stdout.get("selected_gpu_count") or None,
+        "selected_gpu_ids": _normalize_gpu_ids(parsed_stdout.get("selected_gpu_ids")),
+    }
+
+
+def _build_maniskill_inprocess_command() -> list[str]:
+    return ["controller_inprocess", "experiments.robot.maniskill.run_maniskill_eval:_eval_maniskill_impl"]
+
+
+def _build_libero_inprocess_command() -> list[str]:
+    return ["controller_inprocess", "experiments.robot.libero.run_libero_eval:_eval_libero_impl"]
+
+
+def _run_maniskill_inprocess(
+    *,
+    workflow_request: dict[str, Any],
+    workload_key: str,
+    session_id: str,
+    runtime_plan: dict[str, Any],
+    log_path: Path,
+    managed_openpi_runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    command = _build_maniskill_inprocess_command()
+    child_env = _build_child_env(
+        runtime_plan,
+        managed_openpi_runtime={
+            "policy_server_url": str(managed_openpi_runtime["policy_server_url"]),
+            "openpi_conda_env": str(managed_openpi_runtime["openpi_conda_env"]),
+            "openpi_repo_root": str(managed_openpi_runtime["openpi_repo_root"]),
+        }
+        if managed_openpi_runtime is not None
+        else None,
+        openpi_checkpoint=str(workflow_request["checkpoint_map"][workload_key]) if workload_key in MANAGED_OPENPI_POLICY_SERVER_WORKLOADS else None,
+    )
+    launch_metadata = _controller_launch_metadata(
+        workload_key=workload_key,
+        workflow_request=workflow_request,
+        runtime_plan=runtime_plan,
+        launch_path="controller_inprocess",
+        effective_workload_python=sys.executable,
+    )
+    child_env = _apply_workload_child_env(child_env, launch_metadata, workload_key=workload_key)
+
+    try:
+        with _temporary_env(child_env):
+            maniskill_runner = importlib.import_module("experiments.robot.maniskill.run_maniskill_eval")
+            cfg = maniskill_runner.build_maniskill_config_from_workflow_request(workflow_request)
+            cfg.run_id_note = f"{session_id}--{workload_key}"
+            cfg.controller_log_path = str(log_path)
+            result = maniskill_runner._eval_maniskill_impl(cfg)
+    except BaseException as exc:
+        failure_details = failure_metadata_from_exception(exc, failure_phase="controller_inprocess_maniskill")
+        append_breadcrumb_block(
+            log_path,
+            {**launch_metadata, "timestamp": iso_timestamp(), **failure_details},
+            heading="failure",
+        )
+        return {
+            "workload_key": workload_key,
+            "status": "failed",
+            "exit_code": 1,
+            "command": command,
+            "parsed_stdout": {},
+            "summary_path": None,
+            "manifest_path": None,
+            "episodes_path": None,
+            "run_dir": None,
+            "checkpoint": None,
+            "average_success_rate": None,
+            "per_task_success_rate": {},
+            "artifact_paths": {},
+            "log_path": str(log_path),
+            "blocker_reason": failure_details.get("exception_message"),
+            "failure_phase": failure_details.get("failure_phase"),
+            "failure_location": failure_details.get("failure_location"),
+            "exception_type": failure_details.get("exception_type"),
+            "exception_message": failure_details.get("exception_message"),
+            "traceback_tail": failure_details.get("traceback_tail"),
+            "subprocess_detail": None,
+            "launch_path": launch_metadata.get("launch_path"),
+            "controller_python": launch_metadata.get("controller_python"),
+            "effective_workload_python": launch_metadata.get("effective_workload_python"),
+            "selected_gpu_count": launch_metadata.get("selected_gpu_count"),
+            "selected_gpu_ids": launch_metadata.get("selected_gpu_ids"),
+        }
+
+    return {
+        "workload_key": workload_key,
+        "status": "complete",
+        "exit_code": 0,
+        "command": command,
+        "parsed_stdout": {},
+        "summary_path": result.get("summary_path"),
+        "manifest_path": result.get("manifest_path"),
+        "episodes_path": result.get("episodes_path"),
+        "run_dir": result.get("run_dir"),
+        "checkpoint": result.get("checkpoint"),
+        "average_success_rate": result.get("average_success_rate"),
+        "per_task_success_rate": _as_dict(result.get("per_task_success_rate")),
+        "artifact_paths": _as_dict(result.get("artifact_paths")),
+        "log_path": str(log_path),
+        "blocker_reason": None,
+        "failure_phase": None,
+        "failure_location": None,
+        "exception_type": None,
+        "exception_message": None,
+        "traceback_tail": None,
+        "subprocess_detail": None,
+        "launch_path": launch_metadata.get("launch_path"),
+        "controller_python": launch_metadata.get("controller_python"),
+        "effective_workload_python": launch_metadata.get("effective_workload_python"),
+        "selected_gpu_count": launch_metadata.get("selected_gpu_count"),
+        "selected_gpu_ids": launch_metadata.get("selected_gpu_ids"),
+    }
+
+
+def _run_libero_inprocess(
+    *,
+    workflow_request: dict[str, Any],
+    workload_key: str,
+    session_id: str,
+    runtime_plan: dict[str, Any],
+    log_path: Path,
+    managed_openpi_runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    command = _build_libero_inprocess_command()
+    child_env = _build_child_env(
+        runtime_plan,
+        managed_openpi_runtime={
+            "policy_server_url": str(managed_openpi_runtime["policy_server_url"]),
+            "openpi_conda_env": str(managed_openpi_runtime["openpi_conda_env"]),
+            "openpi_repo_root": str(managed_openpi_runtime["openpi_repo_root"]),
+        }
+        if managed_openpi_runtime is not None
+        else None,
+        openpi_checkpoint=str(workflow_request["checkpoint_map"][workload_key]) if workload_key in MANAGED_OPENPI_POLICY_SERVER_WORKLOADS else None,
+    )
+    launch_metadata = _controller_launch_metadata(
+        workload_key=workload_key,
+        workflow_request=workflow_request,
+        runtime_plan=runtime_plan,
+        launch_path="controller_inprocess",
+        effective_workload_python=sys.executable,
+    )
+    child_env = _apply_workload_child_env(child_env, launch_metadata, workload_key=workload_key)
+
+    try:
+        with _temporary_env(child_env):
+            libero_runner = importlib.import_module("experiments.robot.libero.run_libero_eval")
+            cfg = libero_runner.build_libero_config_from_workflow_request(workflow_request)
+            cfg.run_id_note = f"{session_id}--{workload_key}"
+            cfg.controller_log_path = str(log_path)
+            cfg.use_wandb = False
+            result = libero_runner._eval_libero_impl(cfg)
+    except BaseException as exc:
+        failure_details = failure_metadata_from_exception(exc, failure_phase="controller_inprocess_libero")
+        append_breadcrumb_block(
+            log_path,
+            {**launch_metadata, "timestamp": iso_timestamp(), **failure_details},
+            heading="failure",
+        )
+        return {
+            "workload_key": workload_key,
+            "status": "failed",
+            "exit_code": 1,
+            "command": command,
+            "parsed_stdout": {},
+            "summary_path": None,
+            "manifest_path": None,
+            "episodes_path": None,
+            "run_dir": None,
+            "checkpoint": None,
+            "average_success_rate": None,
+            "per_task_success_rate": {},
+            "artifact_paths": {},
+            "log_path": str(log_path),
+            "blocker_reason": failure_details.get("exception_message"),
+            "failure_phase": failure_details.get("failure_phase"),
+            "failure_location": failure_details.get("failure_location"),
+            "exception_type": failure_details.get("exception_type"),
+            "exception_message": failure_details.get("exception_message"),
+            "traceback_tail": failure_details.get("traceback_tail"),
+            "subprocess_detail": None,
+            "launch_path": launch_metadata.get("launch_path"),
+            "controller_python": launch_metadata.get("controller_python"),
+            "effective_workload_python": launch_metadata.get("effective_workload_python"),
+            "selected_gpu_count": launch_metadata.get("selected_gpu_count"),
+            "selected_gpu_ids": launch_metadata.get("selected_gpu_ids"),
+        }
+
+    return {
+        "workload_key": workload_key,
+        "status": "complete",
+        "exit_code": 0,
+        "command": command,
+        "parsed_stdout": {},
+        "summary_path": result.get("summary_path"),
+        "manifest_path": result.get("manifest_path"),
+        "episodes_path": result.get("episodes_path"),
+        "run_dir": result.get("run_dir"),
+        "checkpoint": result.get("checkpoint"),
+        "average_success_rate": result.get("average_success_rate"),
+        "per_task_success_rate": _as_dict(result.get("per_task_success_rate")),
+        "artifact_paths": _as_dict(result.get("artifact_paths")),
+        "log_path": str(log_path),
+        "blocker_reason": None,
+        "failure_phase": None,
+        "failure_location": None,
+        "exception_type": None,
+        "exception_message": None,
+        "traceback_tail": None,
+        "subprocess_detail": None,
+        "launch_path": launch_metadata.get("launch_path"),
+        "controller_python": launch_metadata.get("controller_python"),
+        "effective_workload_python": launch_metadata.get("effective_workload_python"),
+        "selected_gpu_count": launch_metadata.get("selected_gpu_count"),
+        "selected_gpu_ids": launch_metadata.get("selected_gpu_ids"),
     }
 
 
@@ -1461,8 +1821,24 @@ def _execute_workload(
     managed_openpi_runtime: dict[str, Any] | None = None
     policy_server_payload: dict[str, Any] | None = None
     teardown_reason = "not_started"
-    command = _build_command(workflow_request, workload_key, session_id)
+    command = (
+        _build_maniskill_inprocess_command()
+        if workload_key in MANISKILL_WORKLOADS
+        else _build_libero_inprocess_command()
+        if workload_key in LIBERO_WORKLOADS
+        else _build_command(workflow_request, workload_key, session_id)
+    )
     child_env = _build_child_env(runtime_plan)
+    launch_metadata = _controller_launch_metadata(
+        workload_key=workload_key,
+        workflow_request=workflow_request,
+        runtime_plan=runtime_plan,
+        launch_path="controller_inprocess" if workload_key in INPROCESS_WORKLOADS else "controller_subprocess",
+        effective_workload_python=sys.executable if workload_key in INPROCESS_WORKLOADS else (command[0] if command else None),
+    )
+    append_breadcrumb_block(log_path, launch_metadata, heading="launch")
+    if workload_key not in INPROCESS_WORKLOADS:
+        child_env = _apply_workload_child_env(child_env, launch_metadata, workload_key=workload_key)
 
     if workload_key in MANAGED_OPENPI_POLICY_SERVER_WORKLOADS:
         checkpoint = str(workflow_request["checkpoint_map"][workload_key])
@@ -1471,11 +1847,13 @@ def _execute_workload(
                 workload_key=workload_key,
                 checkpoint=checkpoint,
                 workload_dir=workload_dir,
+                log_path=log_path,
                 env=child_env,
             )
             policy_server_payload = _build_policy_server_payload(
                 runtime=managed_openpi_runtime,
                 state="healthy",
+                lifecycle_events=list(managed_openpi_runtime.get("lifecycle_events") or []),
             )
             child_env = _build_child_env(
                 runtime_plan,
@@ -1486,26 +1864,47 @@ def _execute_workload(
                 },
                 openpi_checkpoint=checkpoint,
             )
-            command = _build_command(
-                workflow_request,
-                workload_key,
-                session_id,
-                managed_openpi_runtime={
-                    "policy_server_url": str(managed_openpi_runtime["policy_server_url"]),
-                    "openpi_conda_env": str(managed_openpi_runtime["openpi_conda_env"]),
-                    "openpi_repo_root": str(managed_openpi_runtime["openpi_repo_root"]),
-                },
-            )
+            child_env = _apply_workload_child_env(child_env, launch_metadata, workload_key=workload_key)
+            if workload_key not in INPROCESS_WORKLOADS:
+                command = _build_command(
+                    workflow_request,
+                    workload_key,
+                    session_id,
+                )
         except Exception as exc:
-            message = str(exc).strip() or "OPENPI_POLICY_SERVER_STARTUP_FAILED"
-            log_path.write_text(f"{message}\n")
-            policy_server_payload = {
-                "state": "startup_failed",
-                "error_message": message,
-                "bootstrap_log_path": str(workload_dir / "policy_server_bootstrap.log"),
-                "health_log_path": str(workload_dir / "policy_server_health.log"),
-                "server_log_path": str(workload_dir / "policy_server.log"),
-            }
+            if isinstance(exc, ManagedOpenPILifecycleError):
+                payload = dict(exc.payload)
+                message = str(payload.get("error_message") or str(exc).strip() or "OPENPI_POLICY_SERVER_STARTUP_FAILED")
+                policy_server_payload = dict(payload)
+                failure_details = {
+                    "failure_phase": exc.failure_phase,
+                    "failure_location": payload.get("failure_location") or str(workload_dir / "policy_server_bootstrap.log"),
+                    "exception_type": type(exc).__name__,
+                    "exception_message": message,
+                    "traceback_tail": payload.get("traceback_tail") or message,
+                    "subprocess_detail": shlex.join(payload.get("command") or command),
+                }
+            else:
+                message = str(exc).strip() or "OPENPI_POLICY_SERVER_STARTUP_FAILED"
+                failure_details = failure_metadata_from_exception(
+                    exc,
+                    failure_phase="openpi_policy_server_startup",
+                    subprocess_detail=shlex.join(command),
+                )
+            append_breadcrumb_block(
+                log_path,
+                {**launch_metadata, "timestamp": iso_timestamp(), **failure_details},
+                heading="failure",
+            )
+            if policy_server_payload is None:
+                policy_server_payload = {
+                    "state": "startup_failed",
+                    "error_message": message,
+                    "bootstrap_log_path": str(workload_dir / "policy_server_bootstrap.log"),
+                    "health_log_path": str(workload_dir / "policy_server_health.log"),
+                    "server_log_path": str(workload_dir / "policy_server.log"),
+                    "lifecycle_events": [],
+                }
             child = _failed_execution_result(
                 workload_key=workload_key,
                 command=command,
@@ -1514,6 +1913,8 @@ def _execute_workload(
                 started_at=started_at,
                 error_message=message,
                 policy_server=policy_server_payload,
+                launch_metadata=launch_metadata,
+                failure_details=failure_details,
             )
             child["runner"] = str(workflow_request["workload_details"][workload_key]["runner"])
             child["benchmark"] = str(workflow_request["workload_details"][workload_key]["benchmark"])
@@ -1523,24 +1924,62 @@ def _execute_workload(
             return child
 
     try:
-        process = subprocess.run(
-            command,
-            cwd=REPO_ROOT,
-            env=child_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-        output_text = process.stdout or ""
-        log_path.write_text(output_text)
-        child = _parse_child_result(
-            workload_key=workload_key,
-            command=command,
-            output_text=output_text,
-            exit_code=process.returncode,
-            log_path=log_path,
-        )
+        if workload_key in MANISKILL_WORKLOADS:
+            child = _run_maniskill_inprocess(
+                workflow_request=workflow_request,
+                workload_key=workload_key,
+                session_id=session_id,
+                runtime_plan=runtime_plan,
+                log_path=log_path,
+                managed_openpi_runtime=managed_openpi_runtime,
+            )
+            process_returncode = int(child["exit_code"])
+        elif workload_key in LIBERO_WORKLOADS:
+            child = _run_libero_inprocess(
+                workflow_request=workflow_request,
+                workload_key=workload_key,
+                session_id=session_id,
+                runtime_plan=runtime_plan,
+                log_path=log_path,
+                managed_openpi_runtime=managed_openpi_runtime,
+            )
+            process_returncode = int(child["exit_code"])
+        else:
+            process = subprocess.run(
+                command,
+                cwd=REPO_ROOT,
+                env=child_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+            process_returncode = process.returncode
+            output_text = process.stdout or ""
+            _append_subprocess_output(log_path, output_text)
+            child = _parse_child_result(
+                workload_key=workload_key,
+                command=command,
+                output_text=output_text,
+                exit_code=process.returncode,
+                log_path=log_path,
+            )
+            if child["status"] != "complete":
+                append_breadcrumb_block(
+                    log_path,
+                    {
+                        **launch_metadata,
+                        "timestamp": iso_timestamp(),
+                        "effective_workload_python": child.get("effective_workload_python") or launch_metadata.get("effective_workload_python"),
+                        "failure_phase": child.get("failure_phase"),
+                        "failure_location": child.get("failure_location"),
+                        "exception_type": child.get("exception_type"),
+                        "exception_message": child.get("exception_message"),
+                        "traceback_tail": child.get("traceback_tail"),
+                        "subprocess_detail": child.get("subprocess_detail"),
+                    },
+                    heading="failure",
+                )
         teardown_reason = "child_complete" if child["status"] == "complete" else "child_failed"
     except KeyboardInterrupt:
         teardown_reason = "cancelled"
@@ -1553,22 +1992,31 @@ def _execute_workload(
         )
         if policy_server_payload is not None:
             policy_server_payload["teardown"] = teardown_payload
+            if managed_openpi_runtime is not None:
+                policy_server_payload["lifecycle_events"] = list(managed_openpi_runtime.get("lifecycle_events") or [])
 
     finished_at = time.time()
-    execution_record = {
-        "workload_key": workload_key,
-        "command": command,
-        "cwd": str(REPO_ROOT),
-        "started_at_unix": started_at,
-        "finished_at_unix": finished_at,
-        "duration_seconds": finished_at - started_at,
-        "status": child["status"],
-        "exit_code": process.returncode,
-        "parsed_stdout": child["parsed_stdout"],
-        "error": child["blocker_reason"],
-        "log_path": str(log_path),
-        "policy_server": policy_server_payload,
+    failure_details = {
+        "failure_phase": child.get("failure_phase"),
+        "failure_location": child.get("failure_location"),
+        "exception_type": child.get("exception_type"),
+        "exception_message": child.get("exception_message") or child.get("blocker_reason"),
+        "traceback_tail": child.get("traceback_tail"),
+        "subprocess_detail": child.get("subprocess_detail") or shlex.join(command),
     }
+    execution_record = _build_execution_record(
+        workload_key=workload_key,
+        command=command,
+        log_path=log_path,
+        started_at=started_at,
+        finished_at=finished_at,
+        status=child["status"],
+        exit_code=process_returncode,
+        parsed_stdout=child["parsed_stdout"],
+        failure_details=failure_details,
+        policy_server=policy_server_payload,
+        launch_metadata=launch_metadata,
+    )
     _write_json(execution_record_path, execution_record)
     child["execution_record_path"] = str(execution_record_path)
     child["runner"] = str(workflow_request["workload_details"][workload_key]["runner"])
@@ -1590,25 +2038,17 @@ def _workflow_status(children: list[dict[str, Any]]) -> str:
 
 
 def _run_controller() -> int:
-    try:
-        interpreter_resolution = _ensure_controller_interpreter()
-    except ControllerInterpreterResolutionError as exc:
-        print(f"controller_interpreter_resolution={_json_dumps_compact(exc.payload)}")
-        print(f"controller_interpreter_attempts={_summarize_controller_attempts(list(exc.payload.get('attempts') or []))}")
-        print(str(exc))
-        return 1
-
+    interpreter_resolution = _current_controller_interpreter_resolution()
     print(f"controller_interpreter_resolution={_json_dumps_compact(interpreter_resolution)}")
     print(_describe_controller_interpreter(interpreter_resolution))
     gpu_prompt_context = _compute_gpu_prompt_context()
     try:
         workflow_request = prompt_for_workflow_request(
+            input_fn=_controller_prompt_input,
             output_fn=print,
-            preview_callback=lambda payload: _emit_plan_preview(payload, gpu_prompt_context=gpu_prompt_context),
-            supported_gpu_choices=tuple(_as_string_list(gpu_prompt_context.get("supported_gpu_choices"))),
-            default_gpu_choice=str(gpu_prompt_context.get("default_gpu_choice") or "auto"),
             default_artifact_root=CANONICAL_PARENT_ARTIFACT_ROOT,
-            allow_multiple_workload_selection=True,
+            visible_gpu_count=len(_as_string_list(gpu_prompt_context.get("available_gpu_ids"))),
+            visible_gpu_ids=tuple(_as_string_list(gpu_prompt_context.get("available_gpu_ids"))),
         )
     except ValueError as exc:
         print(str(exc))
@@ -1623,18 +2063,36 @@ def _run_controller() -> int:
     parent_paths = _build_parent_paths(session_id)
     session_dir = parent_paths["session_dir"]
     session_dir.mkdir(parents=True, exist_ok=True)
+    controller_log_path = parent_paths["controller_log_path"]
 
     resolved_workloads = _as_string_list(workflow_request.get("resolved_workloads"))
     runtime_plan = _build_runtime_plan(workflow_request, session_id, parent_paths, gpu_prompt_context=gpu_prompt_context)
     execution_policy = _scheduler_execution_policy(runtime_plan)
-    recommended_gpu = _as_dict(_as_dict(runtime_plan.get("gpu_assignment")).get("recommended_gpu"))
+    controller_launch_metadata = {
+        "timestamp": iso_timestamp(),
+        "launch_path": "interactive_cluster_workflow",
+        "workload_key": ",".join(resolved_workloads),
+        "benchmark": ",".join(
+            str(_as_dict(_as_dict(workflow_request.get("workload_details")).get(key)).get("benchmark", ""))
+            for key in resolved_workloads
+        ),
+        "model_family": ",".join(
+            str(_as_dict(_as_dict(workflow_request.get("workload_details")).get(key)).get("model_family", ""))
+            for key in resolved_workloads
+        ),
+        "controller_python": str(_current_controller_interpreter_resolution().get("selected_python") or sys.executable),
+        "effective_workload_python": None,
+        "selected_gpu_count": execution_policy.get("selected_gpu_count"),
+        "selected_gpu_ids": execution_policy.get("selected_gpu_ids"),
+    }
+    _write_controller_event(controller_log_path, controller_launch_metadata, heading="launch")
     selected_gpu = _as_dict(_as_dict(runtime_plan.get("gpu_assignment")).get("selected_gpu"))
-    print(f"parallel_requested={bool(workflow_request.get('parallel_requested', False))}")
-    print(f"scheduler_policy={execution_policy['policy']}")
+    print(f"execution_model={execution_policy['execution_model']}")
     print(f"scheduler_gpu_heavy_execution={execution_policy['gpu_heavy_execution']}")
     print(f"scheduler_preflight_status={execution_policy['preflight_status']}")
-    print(f"scheduler_recommended_gpu={recommended_gpu.get('gpu')}")
     print(f"scheduler_selected_gpu={selected_gpu.get('gpu')}")
+    print(f"selected_gpu_count={execution_policy['selected_gpu_count']}")
+    print(f"selected_gpu_ids={execution_policy['selected_gpu_ids']}")
     print(f"scheduler_selected_cuda_visible_devices={execution_policy['cuda_visible_devices']}")
     print(f"scheduler_reason={execution_policy['reason']}")
     if execution_policy.get("preflight_blocker"):
@@ -1651,13 +2109,54 @@ def _run_controller() -> int:
         workflow_status_override = "blocked"
         controller_exit_code = 1
         print("workflow_status=blocked")
+        _write_controller_event(
+            controller_log_path,
+            {
+                **controller_launch_metadata,
+                "timestamp": iso_timestamp(),
+                "failure_phase": "workflow_preflight",
+                "failure_location": parent_paths["runtime_plan_path"].name,
+                "exception_message": str(_as_dict(runtime_plan.get("gpu_assignment")).get("blocker") or "workflow blocked"),
+            },
+            heading="failure",
+        )
     else:
         try:
             for workload_key in resolved_workloads:
                 print(f"launching_workload={workload_key}")
+                _write_controller_event(
+                    controller_log_path,
+                    {
+                        **controller_launch_metadata,
+                        "timestamp": iso_timestamp(),
+                        "workload_key": workload_key,
+                        "benchmark": str(_as_dict(_as_dict(workflow_request.get("workload_details")).get(workload_key)).get("benchmark", "")),
+                        "model_family": str(_as_dict(_as_dict(workflow_request.get("workload_details")).get(workload_key)).get("model_family", "")),
+                        "failure_phase": "dispatch_started",
+                    },
+                    heading="dispatch",
+                )
                 child = _execute_workload(workflow_request, workload_key, session_id, session_dir, runtime_plan)
                 children.append(child)
                 print(f"workload_status={workload_key}:{child['status']}")
+                if child["status"] != "complete":
+                    _write_controller_event(
+                        controller_log_path,
+                        {
+                            **controller_launch_metadata,
+                            "timestamp": iso_timestamp(),
+                            "workload_key": workload_key,
+                            "benchmark": child.get("benchmark"),
+                            "model_family": child.get("model_family"),
+                            "effective_workload_python": child.get("effective_workload_python"),
+                            "failure_phase": child.get("failure_phase"),
+                            "failure_location": child.get("failure_location"),
+                            "exception_type": child.get("exception_type"),
+                            "exception_message": child.get("exception_message"),
+                            "traceback_tail": child.get("traceback_tail"),
+                        },
+                        heading="failure",
+                    )
         except KeyboardInterrupt:
             workflow_status_override = "cancelled"
             controller_exit_code = 130
@@ -1669,7 +2168,6 @@ def _run_controller() -> int:
         "generated_at_unix": time.time(),
         "selection": workflow_request["selection"],
         "selected_mode": workflow_request["selected_mode"],
-        "parallel_requested": bool(workflow_request.get("parallel_requested", False)),
         "execution_policy": execution_policy,
         "controller_interpreter": _current_controller_interpreter_resolution(),
         "preflight": _as_dict(runtime_plan.get("gpu_assignment")),
@@ -1684,6 +2182,7 @@ def _run_controller() -> int:
             "session_dir": str(session_dir),
             "summary_path": str(parent_paths["summary_path"]),
             "runtime_plan_path": str(parent_paths["runtime_plan_path"]),
+            "controller_log_path": str(controller_log_path),
         },
         "mode_semantics": _as_dict(workflow_request.get("mode_semantics")),
         "children": {child["workload_key"]: child for child in children},

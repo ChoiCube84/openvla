@@ -13,26 +13,23 @@ WORKFLOW_KEYS = (
     "openvla_libero",
     "openvla_libero_ft",
     "openpi_libero",
-    "all",
 )
 
 PROMPT_SEQUENCE = (
     "workload selection",
     "mode",
-    "parallelism request",
     "artifact root override",
-    "gpu choice",
+    "gpu count",
+    "gpu ids",
     "confirmation",
 )
 
 MODE_KEYS = ("smoke", "full")
-PARALLELISM_ANSWERS = {"y": True, "n": False}
 CONFIRMATION_ANSWERS = {"y": True, "n": False}
 DEFAULT_WORKLOAD_KEY = WORKFLOW_KEYS[0]
 DEFAULT_MODE_KEY = MODE_KEYS[0]
-DEFAULT_PARALLELISM_CHOICE = "n"
 DEFAULT_CONFIRMATION_CHOICE = "n"
-DEFAULT_GPU_CHOICE = "auto"
+SUPPORTED_GPU_COUNTS = ("1", "2")
 CHECKPOINT_MAP = {
     "openvla_maniskill_ft": "Juelg/openvla-7b-finetuned-maniskill",
     "openpi_maniskill": "gs://openpi-assets/checkpoints/pi05_libero",
@@ -47,9 +44,8 @@ CANONICAL_PARENT_ARTIFACT_ROOT = "rollouts/cluster_workflow"
 PARENT_WORKFLOW_SUMMARY_TEMPLATE = "rollouts/cluster_workflow/{session_id}/workflow_summary.json"
 PARENT_WORKFLOW_SUMMARY_CONTRACT = "rollouts/cluster_workflow/<session_id>/workflow_summary.json"
 CLEANUP_ORDER = ("introduce", "validate", "remove")
-LEGACY_LAUNCHER_POLICY = "Legacy launchers are preserved until parity QA completes, then eligible for removal."
 
-_CONCRETE_WORKFLOW_KEYS = tuple(key for key in WORKFLOW_KEYS if key != "all")
+_CONCRETE_WORKFLOW_KEYS = WORKFLOW_KEYS
 _VALID_MODES = set(MODE_KEYS)
 _VALID_BOOLEAN_ANSWERS = {"y", "n"}
 _WORKLOAD_DETAILS = {
@@ -86,7 +82,6 @@ _WORKLOAD_DETAILS = {
 }
 
 WORKFLOW_DEFAULTS: dict[str, object] = {
-    "canonical_shell_entrypoint": "cluster/run_cluster_workflow.sh",
     "canonical_python_entrypoint": "experiments/robot/interactive_cluster_workflow.py",
     "canonical_maniskill_entrypoint": "experiments/robot/maniskill/run_maniskill_eval.py",
     "canonical_libero_entrypoint": "experiments/robot/libero/run_libero_eval.py",
@@ -94,16 +89,13 @@ WORKFLOW_DEFAULTS: dict[str, object] = {
     "parent_workflow_summary_template": PARENT_WORKFLOW_SUMMARY_TEMPLATE,
     "parent_workflow_summary_contract": PARENT_WORKFLOW_SUMMARY_CONTRACT,
     "mode_keys": MODE_KEYS,
-    "parallelism_answers": PARALLELISM_ANSWERS,
     "confirmation_answers": CONFIRMATION_ANSWERS,
     "default_workload_key": DEFAULT_WORKLOAD_KEY,
     "default_mode_key": DEFAULT_MODE_KEY,
-    "default_parallelism_choice": DEFAULT_PARALLELISM_CHOICE,
     "default_confirmation_choice": DEFAULT_CONFIRMATION_CHOICE,
-    "default_gpu_choice": DEFAULT_GPU_CHOICE,
+    "supported_gpu_counts": SUPPORTED_GPU_COUNTS,
     "checkpoint_map": CHECKPOINT_MAP,
     "cleanup_order": CLEANUP_ORDER,
-    "legacy_launcher_policy": LEGACY_LAUNCHER_POLICY,
     "libero_task_suite": LIBERO_TASK_SUITE,
     "libero_num_trials_by_mode": LIBERO_NUM_TRIALS_BY_MODE,
     "maniskill_episode_count_defaults": dict(MANISKILL_EPISODE_COUNT_DEFAULTS),
@@ -136,51 +128,25 @@ def _normalize_choice_with_default(
     return _normalize_choice(value=normalized, field_name=field_name, supported_values=supported_values), False
 
 
-def _normalize_workload_selection(
-    *,
-    value: object,
-    supported_values: Sequence[str],
-    allow_multiple: bool,
-    default_value: str,
-) -> tuple[str, bool]:
+def _normalize_required_choice(*, value: object, field_name: str, supported_values: Sequence[str]) -> str:
+    normalized = _normalize_text(value).lower()
+    if not normalized:
+        supported = ", ".join(supported_values)
+        raise ValueError(f"INVALID_{field_name}: <blank>. Supported values: {supported}")
+    return _normalize_choice(value=normalized, field_name=field_name, supported_values=supported_values)
+
+
+def _normalize_workload_selection(*, value: object, supported_values: Sequence[str], default_value: str) -> tuple[str, bool]:
     normalized = _normalize_text(value).lower()
     if not normalized:
         normalized = default_value.lower()
         used_default = True
     else:
         used_default = False
-    if not allow_multiple:
-        return (
-            _normalize_choice(value=normalized, field_name="WORKLOAD_KEY", supported_values=supported_values),
-            used_default,
-        )
-
-    if normalized == "all":
-        if "all" not in supported_values:
-            supported = ", ".join(supported_values)
-            raise ValueError(f"INVALID_WORKLOAD_KEY: all. Supported values: {supported}")
-        return normalized, used_default
-
-    requested = [item.strip().lower() for item in normalized.split(",") if item.strip()]
-    if not requested:
-        supported = ", ".join(supported_values)
-        raise ValueError(f"INVALID_WORKLOAD_KEY: <blank>. Supported values: {supported}")
-
-    if "all" in requested:
-        supported = ", ".join(supported_values)
-        raise ValueError(f"INVALID_WORKLOAD_KEY: {normalized}. Supported values: {supported}")
-
-    ordered_unique: list[str] = []
-    seen: set[str] = set()
-    for workload_key in requested:
-        if workload_key not in supported_values:
-            supported = ", ".join(supported_values)
-            raise ValueError(f"INVALID_WORKLOAD_KEY: {workload_key}. Supported values: {supported}")
-        if workload_key in seen:
-            continue
-        ordered_unique.append(workload_key)
-        seen.add(workload_key)
-    return ",".join(ordered_unique), used_default
+    return (
+        _normalize_choice(value=normalized, field_name="WORKLOAD_KEY", supported_values=supported_values),
+        used_default,
+    )
 
 
 def _normalize_artifact_root(
@@ -204,27 +170,59 @@ def _render_option_list(options: Sequence[str], recommended: str) -> str:
     return ", ".join(rendered)
 
 
+def _normalize_visible_gpu_ids(visible_gpu_ids: Sequence[str] | None) -> tuple[str, ...]:
+    return tuple(str(choice).strip() for choice in (visible_gpu_ids or ()) if str(choice).strip())
+
+
+def _normalize_gpu_ids(*, value: object, requested_gpu_count: int, visible_gpu_ids: Sequence[str] | None) -> list[str]:
+    normalized = _normalize_text(value)
+    if not normalized:
+        raise ValueError(
+            "INVALID_GPU_IDS: <blank>. Provide explicit GPU IDs matching the selected GPU count "
+            "(example: `0` or `0,1`)."
+        )
+
+    gpu_ids = [item.strip() for item in normalized.split(",") if item.strip()]
+    duplicate_gpu_ids = sorted({gpu_id for gpu_id in gpu_ids if gpu_ids.count(gpu_id) > 1})
+    if duplicate_gpu_ids:
+        duplicates_text = ", ".join(duplicate_gpu_ids)
+        raise ValueError(f"INVALID_GPU_IDS: duplicate GPU IDs are not allowed: {duplicates_text}")
+
+    if len(gpu_ids) != requested_gpu_count:
+        raise ValueError(
+            "INVALID_GPU_IDS: expected "
+            f"{requested_gpu_count} GPU ID(s) but received {len(gpu_ids)} from `{normalized}`."
+        )
+
+    visible_ids = _normalize_visible_gpu_ids(visible_gpu_ids)
+    unavailable_gpu_ids = [gpu_id for gpu_id in gpu_ids if gpu_id not in visible_ids]
+    if unavailable_gpu_ids:
+        unavailable_text = ", ".join(unavailable_gpu_ids)
+        visible_text = ", ".join(visible_ids) if visible_ids else "none"
+        raise ValueError(
+            "INVALID_GPU_IDS: requested GPU ID(s) "
+            f"{unavailable_text} are not available to the controller. Visible GPU IDs: {visible_text}"
+        )
+
+    return gpu_ids
+
+
 def _build_prompt_contract(
     *,
     supported_workload_keys: Sequence[str],
     default_artifact_root: str,
-    supported_gpu_choices: Sequence[str],
-    default_gpu_choice: str,
+    visible_gpu_count: int | None = None,
+    visible_gpu_ids: Sequence[str] | None = None,
 ) -> dict[str, dict[str, object]]:
-    gpu_options = tuple(str(choice).strip().lower() for choice in supported_gpu_choices if str(choice).strip())
-    if not gpu_options:
-        gpu_options = (DEFAULT_GPU_CHOICE,)
-    normalized_default_gpu_choice = _normalize_choice(
-        value=default_gpu_choice,
-        field_name="GPU_CHOICE",
-        supported_values=gpu_options,
-    )
     workload_options = tuple(str(key) for key in supported_workload_keys)
     normalized_default_workload = _normalize_choice(
         value=DEFAULT_WORKLOAD_KEY if DEFAULT_WORKLOAD_KEY in workload_options else workload_options[0],
         field_name="WORKLOAD_KEY",
         supported_values=workload_options,
     )
+    visible_ids = _normalize_visible_gpu_ids(visible_gpu_ids)
+    visible_gpu_count_value = max(0, int(visible_gpu_count or 0))
+    visible_gpu_ids_text = ", ".join(visible_ids) if visible_ids else "none"
     return {
         "workload selection": {
             "name": "workload selection",
@@ -243,15 +241,6 @@ def _build_prompt_contract(
             "display": "Mode options: " + _render_option_list(MODE_KEYS, DEFAULT_MODE_KEY),
             "prompt": f"Select mode [{'/'.join(MODE_KEYS)}]: ",
         },
-        "parallelism request": {
-            "name": "parallelism request",
-            "options": tuple(PARALLELISM_ANSWERS.keys()),
-            "recommended": DEFAULT_PARALLELISM_CHOICE,
-            "blank_behavior": f"blank selects {DEFAULT_PARALLELISM_CHOICE}",
-            "display": "Parallelism request options: "
-            + _render_option_list(tuple(PARALLELISM_ANSWERS.keys()), DEFAULT_PARALLELISM_CHOICE),
-            "prompt": "Request parallel preparation where safe? [y/n]: ",
-        },
         "artifact root override": {
             "name": "artifact root override",
             "options": (
@@ -266,13 +255,27 @@ def _build_prompt_contract(
             ),
             "prompt": "Override artifact root (blank for default): ",
         },
-        "gpu choice": {
-            "name": "gpu choice",
-            "options": gpu_options,
-            "recommended": normalized_default_gpu_choice,
-            "blank_behavior": f"blank selects {normalized_default_gpu_choice}",
-            "display": "GPU choice options: " + _render_option_list(gpu_options, normalized_default_gpu_choice),
-            "prompt": "Select GPU choice: ",
+        "gpu count": {
+            "name": "gpu count",
+            "options": SUPPORTED_GPU_COUNTS,
+            "recommended": "1",
+            "blank_behavior": "blank selects 1",
+            "display": (
+                "GPU count options: " + _render_option_list(SUPPORTED_GPU_COUNTS, "1") + " | "
+                f"controller-visible GPU count: {visible_gpu_count_value} | controller-visible GPU IDs: {visible_gpu_ids_text}"
+            ),
+            "prompt": "Select GPU count [1/2]: ",
+        },
+        "gpu ids": {
+            "name": "gpu ids",
+            "options": visible_ids,
+            "recommended": None,
+            "blank_behavior": "blank is invalid; explicit GPU IDs required",
+            "display": (
+                "GPU IDs must be explicit and comma-separated in the requested execution order. "
+                f"Controller-visible GPU IDs: {visible_gpu_ids_text}"
+            ),
+            "prompt": "Enter GPU ID(s) [example: 0 or 0,1]: ",
         },
         "confirmation": {
             "name": "confirmation",
@@ -298,8 +301,6 @@ def _prompt_contract_options(prompt_contract: dict[str, dict[str, object]], prom
 
 
 def _resolve_workloads(selection: str) -> list[str]:
-    if selection == "all":
-        return list(_CONCRETE_WORKFLOW_KEYS)
     return [item.strip() for item in selection.split(",") if item.strip()]
 
 
@@ -343,26 +344,24 @@ def build_workflow_request_preview(
     *,
     selection: object,
     mode: object,
-    parallel: object,
     artifact_root: object,
-    gpu_choice: object = DEFAULT_GPU_CHOICE,
+    gpu_count: object,
+    gpu_ids: object,
     supported_workload_keys: Sequence[str] | None = None,
-    supported_gpu_choices: Sequence[str] | None = None,
-    default_gpu_choice: str = DEFAULT_GPU_CHOICE,
     default_artifact_root: str = CANONICAL_PARENT_ARTIFACT_ROOT,
-    allow_multiple_workload_selection: bool = False,
+    visible_gpu_count: int | None = None,
+    visible_gpu_ids: Sequence[str] | None = None,
 ) -> dict[str, object]:
     allowed_workloads = tuple(str(key) for key in (supported_workload_keys or WORKFLOW_KEYS))
     prompt_contract = _build_prompt_contract(
         supported_workload_keys=allowed_workloads,
         default_artifact_root=default_artifact_root,
-        supported_gpu_choices=tuple(str(choice) for choice in (supported_gpu_choices or (DEFAULT_GPU_CHOICE,))),
-        default_gpu_choice=default_gpu_choice,
+        visible_gpu_count=visible_gpu_count,
+        visible_gpu_ids=visible_gpu_ids,
     )
     workload_selection, workload_defaulted = _normalize_workload_selection(
         value=selection,
         supported_values=allowed_workloads,
-        allow_multiple=allow_multiple_workload_selection,
         default_value=str(prompt_contract["workload selection"]["recommended"]),
     )
     selected_mode, mode_defaulted = _normalize_choice_with_default(
@@ -371,21 +370,21 @@ def build_workflow_request_preview(
         supported_values=list(MODE_KEYS),
         default_value=_prompt_contract_value(prompt_contract, "mode", "recommended"),
     )
-    parallel_choice, parallel_defaulted = _normalize_choice_with_default(
-        value=parallel,
-        field_name="PARALLELISM_REQUEST",
-        supported_values=["y", "n"],
-        default_value=_prompt_contract_value(prompt_contract, "parallelism request", "recommended"),
-    )
     resolved_artifact_root, artifact_root_overridden, artifact_root_defaulted = _normalize_artifact_root(
         artifact_root,
         default_artifact_root=default_artifact_root,
     )
-    resolved_gpu_choice, gpu_choice_defaulted = _normalize_choice_with_default(
-        value=gpu_choice,
-        field_name="GPU_CHOICE",
-        supported_values=_prompt_contract_options(prompt_contract, "gpu choice"),
-        default_value=_prompt_contract_value(prompt_contract, "gpu choice", "recommended"),
+    resolved_gpu_count, gpu_count_defaulted = _normalize_choice_with_default(
+        value=gpu_count,
+        field_name="GPU_COUNT",
+        supported_values=_prompt_contract_options(prompt_contract, "gpu count"),
+        default_value=_prompt_contract_value(prompt_contract, "gpu count", "recommended"),
+    )
+    selected_gpu_count = int(resolved_gpu_count)
+    resolved_gpu_ids = _normalize_gpu_ids(
+        value=gpu_ids,
+        requested_gpu_count=selected_gpu_count,
+        visible_gpu_ids=visible_gpu_ids,
     )
     resolved_workloads = _resolve_workloads(workload_selection)
     payload = {
@@ -398,21 +397,20 @@ def build_workflow_request_preview(
         "selection_defaulted": workload_defaulted,
         "selected_mode": selected_mode,
         "mode_defaulted": mode_defaulted,
-        "parallel": PARALLELISM_ANSWERS[parallel_choice],
-        "parallel_requested": PARALLELISM_ANSWERS[parallel_choice],
-        "parallel_choice": parallel_choice,
-        "parallel_defaulted": parallel_defaulted,
         "artifact_root": resolved_artifact_root,
         "artifact_root_overridden": artifact_root_overridden,
         "artifact_root_defaulted": artifact_root_defaulted,
-        "gpu_choice": resolved_gpu_choice,
-        "gpu_choice_defaulted": gpu_choice_defaulted,
-        "canonical_shell_entrypoint": WORKFLOW_DEFAULTS["canonical_shell_entrypoint"],
+        "gpu_count": resolved_gpu_count,
+        "gpu_count_defaulted": gpu_count_defaulted,
+        "gpu_ids": list(resolved_gpu_ids),
+        "gpu_ids_csv": ",".join(resolved_gpu_ids),
+        "gpu_ids_defaulted": False,
+        "selected_gpu_count": selected_gpu_count,
+        "selected_gpu_ids": list(resolved_gpu_ids),
         "canonical_python_entrypoint": WORKFLOW_DEFAULTS["canonical_python_entrypoint"],
         "parent_workflow_summary_template": PARENT_WORKFLOW_SUMMARY_TEMPLATE,
         "parent_workflow_summary_contract": PARENT_WORKFLOW_SUMMARY_CONTRACT,
         "cleanup_order": tuple(CLEANUP_ORDER),
-        "legacy_launcher_policy": LEGACY_LAUNCHER_POLICY,
     }
     payload.update(_build_workload_payload(resolved_workloads))
     payload.update(_build_mode_payload(selected_mode))
@@ -451,27 +449,25 @@ def validate_workflow_request(
     *,
     selection: object,
     mode: object,
-    parallel: object,
     artifact_root: object,
+    gpu_count: object,
     confirm: object,
-    gpu_choice: object = DEFAULT_GPU_CHOICE,
+    gpu_ids: object,
     supported_workload_keys: Sequence[str] | None = None,
-    supported_gpu_choices: Sequence[str] | None = None,
-    default_gpu_choice: str = DEFAULT_GPU_CHOICE,
     default_artifact_root: str = CANONICAL_PARENT_ARTIFACT_ROOT,
-    allow_multiple_workload_selection: bool = False,
+    visible_gpu_count: int | None = None,
+    visible_gpu_ids: Sequence[str] | None = None,
 ) -> dict[str, object]:
     preview_payload = build_workflow_request_preview(
         selection=selection,
         mode=mode,
-        parallel=parallel,
         artifact_root=artifact_root,
-        gpu_choice=gpu_choice,
+        gpu_count=gpu_count,
+        gpu_ids=gpu_ids,
         supported_workload_keys=supported_workload_keys,
-        supported_gpu_choices=supported_gpu_choices,
-        default_gpu_choice=default_gpu_choice,
         default_artifact_root=default_artifact_root,
-        allow_multiple_workload_selection=allow_multiple_workload_selection,
+        visible_gpu_count=visible_gpu_count,
+        visible_gpu_ids=visible_gpu_ids,
     )
     confirm_choice, confirmation_defaulted = _normalize_choice_with_default(
         value=confirm,
@@ -509,17 +505,16 @@ def prompt_for_workflow_request(
     output_fn: Callable[[str], object] | None = None,
     preview_callback: Callable[[dict[str, object]], object] | None = None,
     supported_workload_keys: Sequence[str] | None = None,
-    supported_gpu_choices: Sequence[str] | None = None,
-    default_gpu_choice: str = DEFAULT_GPU_CHOICE,
     default_artifact_root: str = CANONICAL_PARENT_ARTIFACT_ROOT,
-    allow_multiple_workload_selection: bool = False,
+    visible_gpu_count: int | None = None,
+    visible_gpu_ids: Sequence[str] | None = None,
 ) -> dict[str, object]:
     allowed_workloads = tuple(str(key) for key in (supported_workload_keys or WORKFLOW_KEYS))
     prompt_contract = _build_prompt_contract(
         supported_workload_keys=allowed_workloads,
         default_artifact_root=default_artifact_root,
-        supported_gpu_choices=tuple(str(choice) for choice in (supported_gpu_choices or (DEFAULT_GPU_CHOICE,))),
-        default_gpu_choice=default_gpu_choice,
+        visible_gpu_count=visible_gpu_count,
+        visible_gpu_ids=visible_gpu_ids,
     )
     if output_fn is not None:
         for prompt_name in PROMPT_SEQUENCE:
@@ -527,21 +522,20 @@ def prompt_for_workflow_request(
 
     selection = input_fn(str(prompt_contract["workload selection"]["prompt"]))
     mode = input_fn(str(prompt_contract["mode"]["prompt"]))
-    parallel = input_fn(str(prompt_contract["parallelism request"]["prompt"]))
     artifact_root = input_fn(str(prompt_contract["artifact root override"]["prompt"]))
-    gpu_choice = input_fn(str(prompt_contract["gpu choice"]["prompt"]))
+    gpu_count = input_fn(str(prompt_contract["gpu count"]["prompt"]))
+    gpu_ids = input_fn(str(prompt_contract["gpu ids"]["prompt"]))
 
     preview_payload = build_workflow_request_preview(
         selection=selection,
         mode=mode,
-        parallel=parallel,
         artifact_root=artifact_root,
-        gpu_choice=gpu_choice,
+        gpu_count=gpu_count,
+        gpu_ids=gpu_ids,
         supported_workload_keys=allowed_workloads,
-        supported_gpu_choices=_prompt_contract_options(prompt_contract, "gpu choice"),
-        default_gpu_choice=default_gpu_choice,
         default_artifact_root=default_artifact_root,
-        allow_multiple_workload_selection=allow_multiple_workload_selection,
+        visible_gpu_count=visible_gpu_count,
+        visible_gpu_ids=visible_gpu_ids,
     )
     if preview_callback is not None:
         _ = preview_callback(preview_payload)
@@ -550,15 +544,14 @@ def prompt_for_workflow_request(
     return validate_workflow_request(
         selection=selection,
         mode=mode,
-        parallel=parallel,
         artifact_root=artifact_root,
+        gpu_count=gpu_count,
         confirm=confirm,
-        gpu_choice=gpu_choice,
+        gpu_ids=gpu_ids,
         supported_workload_keys=allowed_workloads,
-        supported_gpu_choices=_prompt_contract_options(prompt_contract, "gpu choice"),
-        default_gpu_choice=default_gpu_choice,
         default_artifact_root=default_artifact_root,
-        allow_multiple_workload_selection=allow_multiple_workload_selection,
+        visible_gpu_count=visible_gpu_count,
+        visible_gpu_ids=visible_gpu_ids,
     )
 
 
