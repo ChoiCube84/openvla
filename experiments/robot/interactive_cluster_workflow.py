@@ -59,6 +59,22 @@ POLICY_SERVER_HEALTH_TIMEOUT_SECONDS = 45.0
 POLICY_SERVER_HEALTH_POLL_SECONDS = 1.0
 GPU_HEAVY_PHASE_NAME = "gpu_eval"
 SINGLE_GPU_POLICY_NAME = "single_gpu_v1"
+CONTROLLER_PYTHON_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_PYTHON"
+CONTROLLER_CONDA_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_CONDA_ENV"
+CONTROLLER_INTERPRETER_LOCK_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_INTERPRETER_LOCKED"
+CONTROLLER_SELECTED_PYTHON_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_SELECTED_PYTHON"
+CONTROLLER_SELECTED_CONDA_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_SELECTED_CONDA_ENV"
+CONTROLLER_SELECTION_SOURCE_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_SELECTION_SOURCE"
+CONTROLLER_TORCH_VERSION_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_SELECTED_TORCH_VERSION"
+CONTROLLER_SELECTION_STATUS_ENV_KEY = "OPENVLA_CLUSTER_WORKFLOW_INTERPRETER_STATUS"
+CONTROLLER_INTERPRETER_PROBE_PREFIX = "openvla_controller_interpreter_probe="
+KNOWN_CONTROLLER_CONDA_ENVS = ("openvla", "openpi")
+
+
+class ControllerInterpreterResolutionError(RuntimeError):
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__(str(payload.get("remediation") or payload.get("reason") or "controller interpreter resolution failed"))
+        self.payload = payload
 
 
 def _json_default(value: Any) -> Any:
@@ -120,6 +136,361 @@ def _build_session_id() -> str:
     return f"WORKFLOW-{timestamp}-pid{os.getpid()}"
 
 
+def _controller_interpreter_probe_code() -> str:
+    return (
+        "import json\n"
+        "import sys\n"
+        "payload = {'python': sys.executable}\n"
+        "import torch\n"
+        "payload['torch_version'] = getattr(torch, '__version__', 'unknown')\n"
+        f"print({CONTROLLER_INTERPRETER_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True))\n"
+    )
+
+
+def _normalize_executable_path(path: str) -> str:
+    try:
+        return str(Path(path).expanduser().resolve())
+    except Exception:
+        return path
+
+
+def _tail_lines(text: str, *, keep: int = 6) -> str:
+    nonempty = [line.strip() for line in text.splitlines() if line.strip()]
+    if not nonempty:
+        return "no_output"
+    return " | ".join(nonempty[-keep:])
+
+
+def _controller_interpreter_remediation() -> str:
+    known_envs = ", ".join(KNOWN_CONTROLLER_CONDA_ENVS)
+    return (
+        "CONTROLLER_INTERPRETER_RESOLUTION_FAILED: no torch-capable controller interpreter was found. "
+        f"Try {CONTROLLER_CONDA_ENV_KEY}=openvla, {CONTROLLER_CONDA_ENV_KEY}=openpi, or set "
+        f"{CONTROLLER_PYTHON_ENV_KEY}=/absolute/path/to/python3 with torch installed. Auto-probed conda envs: {known_envs}; "
+        "final fallback: PATH python3."
+    )
+
+
+def _summarize_controller_attempts(attempts: list[dict[str, Any]]) -> str:
+    if not attempts:
+        return "no_attempts_recorded"
+    parts: list[str] = []
+    for attempt in attempts:
+        label = str(attempt.get("label") or attempt.get("source") or "unknown")
+        status = str(attempt.get("status") or "unknown")
+        error = str(attempt.get("error") or "").strip()
+        if error:
+            parts.append(f"{label}:{status} ({error})")
+        else:
+            parts.append(f"{label}:{status}")
+    return " | ".join(parts)
+
+
+def _describe_controller_interpreter(resolution: dict[str, Any]) -> str:
+    status = str(resolution.get("status") or "unknown")
+    source = str(resolution.get("selection_source") or "unknown")
+    selected_python = str(resolution.get("selected_python") or sys.executable)
+    selected_conda_env = str(resolution.get("selected_conda_env") or "none")
+    torch_version = str(resolution.get("torch_version") or "unknown")
+    execution_mode = str(resolution.get("execution_mode") or ("locked_reexec" if resolution.get("lock_active") else "current_process"))
+    return (
+        "CONTROLLER_INTERPRETER: "
+        f"status={status}; source={source}; python={selected_python}; "
+        f"conda_env={selected_conda_env}; torch_version={torch_version}; execution_mode={execution_mode}."
+    )
+
+
+def _parse_interpreter_probe(stdout: str) -> dict[str, Any] | None:
+    for line in stdout.splitlines():
+        if line.startswith(CONTROLLER_INTERPRETER_PROBE_PREFIX):
+            try:
+                payload = json.loads(line.split("=", 1)[1])
+            except Exception:
+                return None
+            return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _probe_python_interpreter(python_executable: str, *, source: str, label: str) -> dict[str, Any]:
+    expanded_python = str(Path(python_executable).expanduser())
+    if not os.path.exists(expanded_python):
+        return {
+            "source": source,
+            "label": label,
+            "status": "missing",
+            "python": expanded_python,
+            "error": f"interpreter not found at `{expanded_python}`",
+        }
+    if not os.access(expanded_python, os.X_OK):
+        return {
+            "source": source,
+            "label": label,
+            "status": "missing",
+            "python": expanded_python,
+            "error": f"interpreter is not executable at `{expanded_python}`",
+        }
+    process = subprocess.run(
+        [expanded_python, "-c", _controller_interpreter_probe_code()],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    parsed = _parse_interpreter_probe(process.stdout or "")
+    if process.returncode == 0 and parsed is not None:
+        resolved_python = str(parsed.get("python") or expanded_python)
+        return {
+            "source": source,
+            "label": label,
+            "status": "ready",
+            "python": resolved_python,
+            "torch_version": str(parsed.get("torch_version") or "unknown"),
+            "error": None,
+        }
+    return {
+        "source": source,
+        "label": label,
+        "status": "rejected",
+        "python": expanded_python,
+        "error": _tail_lines(process.stdout or ""),
+    }
+
+
+def _probe_conda_env(conda_executable: str, env_name: str, *, source: str, label: str) -> dict[str, Any]:
+    process = subprocess.run(
+        [conda_executable, "run", "--no-capture-output", "-n", env_name, "python3", "-c", _controller_interpreter_probe_code()],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    parsed = _parse_interpreter_probe(process.stdout or "")
+    if process.returncode == 0 and parsed is not None:
+        return {
+            "source": source,
+            "label": label,
+            "status": "ready",
+            "python": str(parsed.get("python") or "python3"),
+            "conda_env": env_name,
+            "conda_executable": conda_executable,
+            "torch_version": str(parsed.get("torch_version") or "unknown"),
+            "error": None,
+        }
+    return {
+        "source": source,
+        "label": label,
+        "status": "rejected",
+        "python": None,
+        "conda_env": env_name,
+        "conda_executable": conda_executable,
+        "error": _tail_lines(process.stdout or ""),
+    }
+
+
+def _probe_path_python3() -> dict[str, Any]:
+    process = subprocess.run(
+        ["python3", "-c", _controller_interpreter_probe_code()],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    parsed = _parse_interpreter_probe(process.stdout or "")
+    if process.returncode == 0 and parsed is not None:
+        return {
+            "source": "path_python3",
+            "label": "PATH python3",
+            "status": "ready",
+            "python": str(parsed.get("python") or shutil.which("python3") or "python3"),
+            "torch_version": str(parsed.get("torch_version") or "unknown"),
+            "error": None,
+        }
+    return {
+        "source": "path_python3",
+        "label": "PATH python3",
+        "status": "rejected",
+        "python": shutil.which("python3") or "python3",
+        "error": _tail_lines(process.stdout or ""),
+    }
+
+
+def _resolve_controller_interpreter() -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+    explicit_python = os.environ.get(CONTROLLER_PYTHON_ENV_KEY, "").strip()
+    explicit_conda_env = os.environ.get(CONTROLLER_CONDA_ENV_KEY, "").strip()
+    conda_executable = shutil.which("conda")
+
+    if explicit_python:
+        probe = _probe_python_interpreter(
+            explicit_python,
+            source="explicit_python_env",
+            label=f"{CONTROLLER_PYTHON_ENV_KEY}={explicit_python}",
+        )
+        attempts.append(probe)
+        if probe["status"] == "ready":
+            return {
+                "status": "ready",
+                "selection_source": probe["source"],
+                "selected_python": probe["python"],
+                "selected_conda_env": None,
+                "torch_version": probe["torch_version"],
+                "attempts": attempts,
+                "requested_python": explicit_python,
+                "requested_conda_env": explicit_conda_env or None,
+            }
+
+    if explicit_conda_env:
+        if conda_executable:
+            probe = _probe_conda_env(
+                conda_executable,
+                explicit_conda_env,
+                source="explicit_conda_env",
+                label=f"{CONTROLLER_CONDA_ENV_KEY}={explicit_conda_env}",
+            )
+        else:
+            probe = {
+                "source": "explicit_conda_env",
+                "label": f"{CONTROLLER_CONDA_ENV_KEY}={explicit_conda_env}",
+                "status": "missing",
+                "python": None,
+                "conda_env": explicit_conda_env,
+                "error": "`conda` executable not found on PATH",
+            }
+        attempts.append(probe)
+        if probe["status"] == "ready":
+            return {
+                "status": "ready",
+                "selection_source": probe["source"],
+                "selected_python": probe["python"],
+                "selected_conda_env": explicit_conda_env,
+                "torch_version": probe["torch_version"],
+                "attempts": attempts,
+                "requested_python": explicit_python or None,
+                "requested_conda_env": explicit_conda_env,
+                "conda_executable": conda_executable,
+            }
+
+    if conda_executable:
+        for env_name in KNOWN_CONTROLLER_CONDA_ENVS:
+            if env_name == explicit_conda_env:
+                continue
+            probe = _probe_conda_env(
+                conda_executable,
+                env_name,
+                source=f"known_conda_env:{env_name}",
+                label=f"known conda env {env_name}",
+            )
+            attempts.append(probe)
+            if probe["status"] == "ready":
+                return {
+                    "status": "ready",
+                    "selection_source": probe["source"],
+                    "selected_python": probe["python"],
+                    "selected_conda_env": env_name,
+                    "torch_version": probe["torch_version"],
+                    "attempts": attempts,
+                    "requested_python": explicit_python or None,
+                    "requested_conda_env": explicit_conda_env or None,
+                    "conda_executable": conda_executable,
+                }
+    else:
+        attempts.append(
+            {
+                "source": "known_conda_envs",
+                "label": ", ".join(KNOWN_CONTROLLER_CONDA_ENVS),
+                "status": "missing",
+                "python": None,
+                "error": "`conda` executable not found on PATH",
+            }
+        )
+
+    path_probe = _probe_path_python3()
+    attempts.append(path_probe)
+    if path_probe["status"] == "ready":
+        return {
+            "status": "ready",
+            "selection_source": path_probe["source"],
+            "selected_python": path_probe["python"],
+            "selected_conda_env": None,
+            "torch_version": path_probe["torch_version"],
+            "attempts": attempts,
+            "requested_python": explicit_python or None,
+            "requested_conda_env": explicit_conda_env or None,
+        }
+
+    return {
+        "status": "blocked",
+        "selection_source": None,
+        "selected_python": None,
+        "selected_conda_env": None,
+        "torch_version": None,
+        "attempts": attempts,
+        "requested_python": explicit_python or None,
+        "requested_conda_env": explicit_conda_env or None,
+        "reason": "No torch-capable interpreter probe succeeded.",
+        "remediation": _controller_interpreter_remediation(),
+    }
+
+
+def _export_controller_interpreter_resolution(resolution: dict[str, Any]) -> None:
+    os.environ[CONTROLLER_SELECTION_STATUS_ENV_KEY] = str(resolution.get("status") or "unknown")
+    os.environ[CONTROLLER_SELECTION_SOURCE_ENV_KEY] = str(resolution.get("selection_source") or "")
+    os.environ[CONTROLLER_SELECTED_PYTHON_ENV_KEY] = str(resolution.get("selected_python") or "")
+    os.environ[CONTROLLER_SELECTED_CONDA_ENV_KEY] = str(resolution.get("selected_conda_env") or "")
+    os.environ[CONTROLLER_TORCH_VERSION_ENV_KEY] = str(resolution.get("torch_version") or "")
+
+
+def _current_controller_interpreter_resolution() -> dict[str, Any]:
+    return {
+        "status": os.environ.get(CONTROLLER_SELECTION_STATUS_ENV_KEY, "unknown") or "unknown",
+        "selection_source": os.environ.get(CONTROLLER_SELECTION_SOURCE_ENV_KEY, "").strip() or None,
+        "selected_python": os.environ.get(CONTROLLER_SELECTED_PYTHON_ENV_KEY, "").strip() or sys.executable,
+        "selected_conda_env": os.environ.get(CONTROLLER_SELECTED_CONDA_ENV_KEY, "").strip() or None,
+        "torch_version": os.environ.get(CONTROLLER_TORCH_VERSION_ENV_KEY, "").strip() or None,
+        "requested_python": os.environ.get(CONTROLLER_PYTHON_ENV_KEY, "").strip() or None,
+        "requested_conda_env": os.environ.get(CONTROLLER_CONDA_ENV_KEY, "").strip() or None,
+        "lock_active": os.environ.get(CONTROLLER_INTERPRETER_LOCK_ENV_KEY, "").strip() == "1",
+    }
+
+
+def _same_interpreter(path_a: str | None, path_b: str | None) -> bool:
+    if not path_a or not path_b:
+        return False
+    return _normalize_executable_path(path_a) == _normalize_executable_path(path_b)
+
+
+def _ensure_controller_interpreter() -> dict[str, Any]:
+    if os.environ.get(CONTROLLER_INTERPRETER_LOCK_ENV_KEY, "").strip() == "1":
+        return _current_controller_interpreter_resolution()
+
+    resolution = _resolve_controller_interpreter()
+    if resolution.get("status") != "ready":
+        raise ControllerInterpreterResolutionError(resolution)
+
+    selected_python = str(resolution.get("selected_python") or "")
+    selected_conda_env = str(resolution.get("selected_conda_env") or "").strip() or None
+    resolution["reexec_required"] = bool(selected_conda_env or not _same_interpreter(selected_python, sys.executable))
+    _export_controller_interpreter_resolution(resolution)
+
+    if not resolution["reexec_required"]:
+        resolution["execution_mode"] = "current_process"
+        return resolution
+
+    env = dict(os.environ)
+    env[CONTROLLER_INTERPRETER_LOCK_ENV_KEY] = "1"
+    env[CONTROLLER_SELECTION_STATUS_ENV_KEY] = "ready"
+    env[CONTROLLER_SELECTION_SOURCE_ENV_KEY] = str(resolution.get("selection_source") or "")
+    env[CONTROLLER_SELECTED_PYTHON_ENV_KEY] = selected_python
+    env[CONTROLLER_SELECTED_CONDA_ENV_KEY] = str(selected_conda_env or "")
+    env[CONTROLLER_TORCH_VERSION_ENV_KEY] = str(resolution.get("torch_version") or "")
+    script_path = str(Path(__file__).resolve())
+    if selected_conda_env:
+        conda_executable = str(resolution.get("conda_executable") or shutil.which("conda") or "conda")
+        command = [conda_executable, "run", "--no-capture-output", "-n", selected_conda_env, "python3", script_path, *sys.argv[1:]]
+        os.execvpe(conda_executable, command, env)
+    os.execvpe(selected_python, [selected_python, script_path, *sys.argv[1:]], env)
+
+
 def _build_parent_paths(session_id: str) -> dict[str, Path]:
     session_dir = Path(CANONICAL_PARENT_ARTIFACT_ROOT) / session_id
     return {
@@ -131,6 +502,11 @@ def _build_parent_paths(session_id: str) -> dict[str, Path]:
 
 def _json_dumps_compact(payload: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, default=_json_default)
+
+
+def _normalize_gpu_choice(value: object) -> str | None:
+    normalized = str(value or "").strip().lower()
+    return normalized or None
 
 
 def _query_nvidia_smi_gpu_rows() -> tuple[list[dict[str, int]], str | None]:
@@ -176,47 +552,48 @@ def _query_nvidia_smi_gpu_rows() -> tuple[list[dict[str, int]], str | None]:
     return rows, None
 
 
-def _detect_gpu_assignment() -> dict[str, Any]:
+def _compute_gpu_prompt_context() -> dict[str, Any]:
     visible_devices_raw = os.environ.get("CUDA_VISIBLE_DEVICES")
-    explicit_gpu_index_raw = os.environ.get(DEFAULT_GPU_INDEX_ENV_KEY, "").strip()
-    visible_devices = []
+    visible_devices: list[str] = []
     if visible_devices_raw is not None:
         visible_devices = [entry.strip() for entry in visible_devices_raw.split(",") if entry.strip()]
 
-    assignment: dict[str, Any] = {
+    context: dict[str, Any] = {
         "status": "blocked",
         "policy": SINGLE_GPU_POLICY_NAME,
-        "selected_gpu": None,
-        "cuda_visible_devices": None,
-        "reason": "GPU preflight not evaluated.",
+        "default_gpu_choice": "auto",
+        "supported_gpu_choices": ["auto"],
+        "available_gpu_choices": [],
+        "recommended_gpu": None,
+        "reason": "GPU recommendation preflight not evaluated.",
         "blocker": None,
         "host_observation": {
             "cuda_visible_devices_env": visible_devices_raw,
             "visible_devices_entries": visible_devices,
             "required_gpu_index_env_key": DEFAULT_GPU_INDEX_ENV_KEY,
-            "required_gpu_index": explicit_gpu_index_raw or None,
         },
-        "selection_trace": [],
+        "recommendation_trace": [],
+        "recommendation": None,
     }
 
     if visible_devices_raw is not None and not visible_devices:
-        assignment["blocker"] = (
+        context["blocker"] = (
             "GPU_PREFLIGHT_BLOCKED: `CUDA_VISIBLE_DEVICES` is explicitly set but hides all GPUs; "
             "single-GPU scheduling cannot proceed."
         )
-        assignment["reason"] = "The host environment explicitly masked every CUDA device."
-        return assignment
+        context["reason"] = "The host environment explicitly masked every CUDA device."
+        return context
 
     try:
         torch = importlib.import_module("torch")
     except Exception as exc:
-        assignment["blocker"] = f"GPU_PREFLIGHT_BLOCKED: unable to import `torch` for CUDA discovery: {exc}"
-        assignment["reason"] = "Cannot validate or assign a GPU without torch CUDA discovery."
-        return assignment
+        context["blocker"] = f"GPU_PREFLIGHT_BLOCKED: unable to import `torch` for CUDA discovery: {exc}"
+        context["reason"] = "Cannot validate or recommend a GPU without torch CUDA discovery."
+        return context
 
     cuda_available = bool(torch.cuda.is_available())
     device_count = int(torch.cuda.device_count()) if cuda_available else 0
-    assignment["host_observation"].update(
+    context["host_observation"].update(
         {
             "torch_cuda_available": cuda_available,
             "torch_visible_device_count": device_count,
@@ -224,55 +601,136 @@ def _detect_gpu_assignment() -> dict[str, Any]:
     )
 
     if not cuda_available or device_count < 1:
-        required_label = explicit_gpu_index_raw or (visible_devices_raw if visible_devices_raw is not None else "auto")
-        assignment["blocker"] = (
-            "GPU_PREFLIGHT_BLOCKED: no CUDA device is available to the controller "
-            f"(requested={required_label})."
-        )
-        assignment["reason"] = "The controller will not pretend single-GPU scheduling succeeded on a no-GPU host."
-        return assignment
+        context["blocker"] = "GPU_PREFLIGHT_BLOCKED: no CUDA device is available to the controller (requested=auto)."
+        context["reason"] = "The controller will not pretend single-GPU scheduling succeeded on a no-GPU host."
+        return context
 
-    if explicit_gpu_index_raw:
-        if visible_devices and explicit_gpu_index_raw not in visible_devices:
-            assignment["blocker"] = (
-                "GPU_PREFLIGHT_BLOCKED: explicit GPU index "
-                f"{explicit_gpu_index_raw} is not present in CUDA_VISIBLE_DEVICES={visible_devices_raw!r}."
-            )
-            assignment["reason"] = "The explicit GPU request conflicts with the visible-device mask."
-            return assignment
-        assignment["selection_trace"].append("using explicit OPENVLA_MANISKILL_GPU_INDEX")
-        selected_gpu = explicit_gpu_index_raw
-        selection_source = DEFAULT_GPU_INDEX_ENV_KEY
+    available_gpu_choices = visible_devices or [str(index) for index in range(device_count)]
+    context["available_gpu_choices"] = available_gpu_choices
+    context["supported_gpu_choices"] = ["auto", *available_gpu_choices]
+
+    smi_rows, smi_error = _query_nvidia_smi_gpu_rows()
+    available_gpu_set = set(available_gpu_choices)
+    filtered_smi_rows = [row for row in smi_rows if str(row.get("index")) in available_gpu_set]
+    context["host_observation"]["nvidia_smi_rows"] = smi_rows
+    context["host_observation"]["nvidia_smi_error"] = smi_error
+    context["host_observation"]["nvidia_smi_rows_considered"] = filtered_smi_rows
+
+    recommendation_trace = _as_string_list(context.get("recommendation_trace"))
+    if filtered_smi_rows:
+        recommended_gpu = str(filtered_smi_rows[0]["index"])
+        recommendation_source = "nvidia-smi least-busy GPU"
+        recommendation_reason = "Selected the least-used GPU reported by nvidia-smi among GPUs available to the controller."
+        recommendation_trace.append("selected least-used GPU from nvidia-smi")
     elif visible_devices:
-        selected_gpu = visible_devices[0]
-        selection_source = "CUDA_VISIBLE_DEVICES[first_visible]"
-        assignment["selection_trace"].append("selected first visible device from CUDA_VISIBLE_DEVICES")
+        recommended_gpu = visible_devices[0]
+        recommendation_source = "CUDA_VISIBLE_DEVICES[first_visible]"
+        recommendation_reason = "nvidia-smi could not recommend an available GPU, so the first visible CUDA device was used."
+        recommendation_trace.append("selected first visible device from CUDA_VISIBLE_DEVICES")
     else:
-        smi_rows, smi_error = _query_nvidia_smi_gpu_rows()
-        assignment["host_observation"]["nvidia_smi_rows"] = smi_rows
-        assignment["host_observation"]["nvidia_smi_error"] = smi_error
-        if smi_rows:
-            selected_gpu = str(smi_rows[0]["index"])
-            selection_source = "nvidia-smi least-busy GPU"
-            assignment["selection_trace"].append("selected least-busy GPU from nvidia-smi")
-        else:
-            selected_gpu = "0"
-            selection_source = "torch first visible GPU fallback"
-            assignment["selection_trace"].append("fell back to GPU 0 because nvidia-smi was unavailable")
+        recommended_gpu = "0"
+        recommendation_source = "torch first visible GPU fallback"
+        recommendation_reason = "nvidia-smi was unavailable, so GPU 0 was used because torch confirmed visible CUDA devices."
+        recommendation_trace.append("fell back to GPU 0 because nvidia-smi was unavailable")
 
-    assignment.update(
+    context.update(
         {
             "status": "ready",
-            "selected_gpu": {
-                "gpu": selected_gpu,
-                "selection_source": selection_source,
-                "cuda_visible_devices": selected_gpu,
+            "default_gpu_choice": recommended_gpu,
+            "reason": "GPU recommendation is ready for the single-GPU execution policy.",
+            "recommendation_trace": recommendation_trace,
+            "recommended_gpu": {
+                "gpu": recommended_gpu,
+                "selection_source": recommendation_source,
+                "cuda_visible_devices": recommended_gpu,
+                "reason": recommendation_reason,
             },
-            "cuda_visible_devices": selected_gpu,
-            "reason": "Single-GPU scheduling selected one deterministic CUDA device for all GPU-heavy phases.",
-            "blocker": None,
+            "recommendation": {
+                "gpu": recommended_gpu,
+                "selection_source": recommendation_source,
+                "cuda_visible_devices": recommended_gpu,
+                "reason": recommendation_reason,
+                "trace": recommendation_trace,
+            },
         }
     )
+    return context
+
+
+def _resolve_gpu_assignment(
+    workflow_request: dict[str, Any],
+    *,
+    gpu_prompt_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    prompt_context = dict(gpu_prompt_context or _compute_gpu_prompt_context())
+    assignment: dict[str, Any] = {
+        "status": str(prompt_context.get("status") or "blocked"),
+        "policy": SINGLE_GPU_POLICY_NAME,
+        "available_gpu_choices": _as_string_list(prompt_context.get("available_gpu_choices")),
+        "supported_gpu_choices": _as_string_list(prompt_context.get("supported_gpu_choices")),
+        "default_gpu_choice": _normalize_gpu_choice(prompt_context.get("default_gpu_choice")) or "auto",
+        "requested_gpu_choice": _normalize_gpu_choice(workflow_request.get("gpu_choice")),
+        "requested_gpu_choice_source": "workflow_request.gpu_choice",
+        "requested_gpu_choice_defaulted": bool(workflow_request.get("gpu_choice_defaulted", False)),
+        "recommended_gpu": _as_dict(prompt_context.get("recommended_gpu")) or _as_dict(prompt_context.get("recommendation")),
+        "recommendation": _as_dict(prompt_context.get("recommendation")),
+        "selected_gpu": None,
+        "cuda_visible_devices": None,
+        "reason": str(prompt_context.get("reason") or "GPU preflight not evaluated."),
+        "blocker": prompt_context.get("blocker"),
+        "host_observation": _as_dict(prompt_context.get("host_observation")),
+        "selection_trace": [],
+    }
+
+    if assignment["status"] != "ready":
+        return assignment
+
+    available_gpu_choices = _as_string_list(assignment.get("available_gpu_choices"))
+    requested_gpu_choice = _normalize_gpu_choice(workflow_request.get("gpu_choice"))
+    requested_gpu_choice_defaulted = bool(workflow_request.get("gpu_choice_defaulted", False))
+    recommended_gpu = _as_dict(assignment.get("recommended_gpu"))
+    selected_gpu_payload: dict[str, Any]
+
+    if requested_gpu_choice and requested_gpu_choice != "auto" and not requested_gpu_choice_defaulted:
+        if requested_gpu_choice not in available_gpu_choices:
+            visible_devices_raw = assignment["host_observation"].get("cuda_visible_devices_env")
+            assignment["status"] = "blocked"
+            assignment["blocker"] = (
+                "GPU_PREFLIGHT_BLOCKED: explicit GPU index "
+                f"{requested_gpu_choice} is not available to the controller"
+                + (f" under CUDA_VISIBLE_DEVICES={visible_devices_raw!r}." if visible_devices_raw is not None else ".")
+            )
+            assignment["reason"] = "The explicit GPU request conflicts with the controller-visible CUDA devices."
+            return assignment
+        assignment["selection_trace"] = ["using explicit workflow_request.gpu_choice"]
+        selected_gpu_payload = {
+            "gpu": requested_gpu_choice,
+            "selection_source": "workflow_request.gpu_choice",
+            "cuda_visible_devices": requested_gpu_choice,
+            "reason": "The user selected an explicit GPU, so it overrides the recommendation.",
+        }
+    else:
+        if not recommended_gpu:
+            assignment["status"] = "blocked"
+            assignment["blocker"] = "GPU_PREFLIGHT_BLOCKED: no recommended GPU was available for selection."
+            assignment["reason"] = "The controller could not convert the prompt recommendation into a runtime GPU assignment."
+            return assignment
+        trace_entry = (
+            "resolved auto GPU choice to recommendation"
+            if requested_gpu_choice == "auto" and not requested_gpu_choice_defaulted
+            else "used recommended/default GPU choice"
+        )
+        assignment["selection_trace"] = [trace_entry]
+        selected_gpu_payload = {
+            "gpu": str(recommended_gpu.get("gpu") or ""),
+            "selection_source": str(recommended_gpu.get("selection_source") or "recommended/default"),
+            "cuda_visible_devices": str(recommended_gpu.get("cuda_visible_devices") or recommended_gpu.get("gpu") or ""),
+            "reason": str(recommended_gpu.get("reason") or "The recommended GPU was selected for execution."),
+        }
+
+    assignment["selected_gpu"] = selected_gpu_payload
+    assignment["cuda_visible_devices"] = selected_gpu_payload["cuda_visible_devices"]
+    assignment["reason"] = "Single-GPU scheduling selected one deterministic CUDA device for all GPU-heavy phases."
     return assignment
 
 
@@ -338,10 +796,12 @@ def _build_runtime_plan(
     session_id: str,
     parent_paths: dict[str, Path],
     *,
+    gpu_prompt_context: dict[str, Any] | None = None,
     write_output: bool = True,
 ) -> dict[str, Any]:
     resolved_workloads = _as_string_list(workflow_request.get("resolved_workloads"))
-    gpu_assignment = _detect_gpu_assignment()
+    controller_interpreter = _current_controller_interpreter_resolution()
+    gpu_assignment = _resolve_gpu_assignment(workflow_request, gpu_prompt_context=gpu_prompt_context)
     runtime_estimate = _load_maniskill_runtime_estimate(str(workflow_request.get("selected_mode", "")))
     requested_parallelism = bool(workflow_request.get("parallel_requested", False))
     integrated_workflow_blockers = _integrated_workflow_blockers(workflow_request)
@@ -393,6 +853,7 @@ def _build_runtime_plan(
         "gpu_heavy_execution": "serialized_single_gpu",
         "scheduling_reason": scheduling_reason,
         "gpu_assignment": gpu_assignment,
+        "controller_interpreter": controller_interpreter,
         "workflow_blockers": integrated_workflow_blockers,
         "runtime_estimate": runtime_estimate,
         "planned_workloads": plan_items,
@@ -462,7 +923,11 @@ def _resolve_child_artifact_root(workflow_request: dict[str, Any], workload_key:
     return str(detail.get("artifact_root", "")).strip()
 
 
-def _build_preview_runtime_plan(workflow_request: dict[str, Any]) -> dict[str, Any]:
+def _build_preview_runtime_plan(
+    workflow_request: dict[str, Any],
+    *,
+    gpu_prompt_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     parent_paths = {
         "runtime_plan_path": Path(CANONICAL_PARENT_ARTIFACT_ROOT) / "<pending_confirmation>" / RUNTIME_PLAN_FILENAME,
         "summary_path": Path(CANONICAL_PARENT_ARTIFACT_ROOT) / "<pending_confirmation>" / PARENT_SUMMARY_FILENAME,
@@ -472,6 +937,7 @@ def _build_preview_runtime_plan(workflow_request: dict[str, Any]) -> dict[str, A
         workflow_request,
         "PENDING_CONFIRMATION",
         parent_paths,
+        gpu_prompt_context=gpu_prompt_context,
         write_output=False,
     )
     runtime_plan["preview_only"] = True
@@ -483,8 +949,13 @@ def _build_preview_runtime_plan(workflow_request: dict[str, Any]) -> dict[str, A
     return runtime_plan
 
 
-def _emit_plan_preview(workflow_request: dict[str, Any]) -> None:
-    runtime_plan = _build_preview_runtime_plan(workflow_request)
+def _emit_plan_preview(
+    workflow_request: dict[str, Any],
+    *,
+    gpu_prompt_context: dict[str, Any] | None = None,
+) -> None:
+    runtime_plan = _build_preview_runtime_plan(workflow_request, gpu_prompt_context=gpu_prompt_context)
+    gpu_assignment = _as_dict(runtime_plan.get("gpu_assignment"))
     preview_payload = {
         "status": runtime_plan.get("status"),
         "selected_mode": workflow_request.get("selected_mode"),
@@ -493,7 +964,10 @@ def _emit_plan_preview(workflow_request: dict[str, Any]) -> None:
         "requested_artifact_root": workflow_request.get("artifact_root"),
         "scheduler_policy": runtime_plan.get("scheduler_policy"),
         "gpu_heavy_execution": runtime_plan.get("gpu_heavy_execution"),
-        "gpu_assignment": runtime_plan.get("gpu_assignment"),
+        "available_gpu_choices": gpu_assignment.get("available_gpu_choices"),
+        "recommended_gpu": gpu_assignment.get("recommended_gpu"),
+        "selected_gpu": gpu_assignment.get("selected_gpu"),
+        "gpu_assignment": gpu_assignment,
         "workflow_blockers": runtime_plan.get("workflow_blockers"),
         "planned_workloads": runtime_plan.get("planned_workloads"),
     }
@@ -1117,8 +1591,22 @@ def _workflow_status(children: list[dict[str, Any]]) -> str:
 
 def _run_controller() -> int:
     try:
+        interpreter_resolution = _ensure_controller_interpreter()
+    except ControllerInterpreterResolutionError as exc:
+        print(f"controller_interpreter_resolution={_json_dumps_compact(exc.payload)}")
+        print(f"controller_interpreter_attempts={_summarize_controller_attempts(list(exc.payload.get('attempts') or []))}")
+        print(str(exc))
+        return 1
+
+    print(f"controller_interpreter_resolution={_json_dumps_compact(interpreter_resolution)}")
+    print(_describe_controller_interpreter(interpreter_resolution))
+    gpu_prompt_context = _compute_gpu_prompt_context()
+    try:
         workflow_request = prompt_for_workflow_request(
-            preview_callback=_emit_plan_preview,
+            output_fn=print,
+            preview_callback=lambda payload: _emit_plan_preview(payload, gpu_prompt_context=gpu_prompt_context),
+            supported_gpu_choices=tuple(_as_string_list(gpu_prompt_context.get("supported_gpu_choices"))),
+            default_gpu_choice=str(gpu_prompt_context.get("default_gpu_choice") or "auto"),
             default_artifact_root=CANONICAL_PARENT_ARTIFACT_ROOT,
             allow_multiple_workload_selection=True,
         )
@@ -1137,12 +1625,16 @@ def _run_controller() -> int:
     session_dir.mkdir(parents=True, exist_ok=True)
 
     resolved_workloads = _as_string_list(workflow_request.get("resolved_workloads"))
-    runtime_plan = _build_runtime_plan(workflow_request, session_id, parent_paths)
+    runtime_plan = _build_runtime_plan(workflow_request, session_id, parent_paths, gpu_prompt_context=gpu_prompt_context)
     execution_policy = _scheduler_execution_policy(runtime_plan)
+    recommended_gpu = _as_dict(_as_dict(runtime_plan.get("gpu_assignment")).get("recommended_gpu"))
+    selected_gpu = _as_dict(_as_dict(runtime_plan.get("gpu_assignment")).get("selected_gpu"))
     print(f"parallel_requested={bool(workflow_request.get('parallel_requested', False))}")
     print(f"scheduler_policy={execution_policy['policy']}")
     print(f"scheduler_gpu_heavy_execution={execution_policy['gpu_heavy_execution']}")
     print(f"scheduler_preflight_status={execution_policy['preflight_status']}")
+    print(f"scheduler_recommended_gpu={recommended_gpu.get('gpu')}")
+    print(f"scheduler_selected_gpu={selected_gpu.get('gpu')}")
     print(f"scheduler_selected_cuda_visible_devices={execution_policy['cuda_visible_devices']}")
     print(f"scheduler_reason={execution_policy['reason']}")
     if execution_policy.get("preflight_blocker"):
@@ -1179,6 +1671,7 @@ def _run_controller() -> int:
         "selected_mode": workflow_request["selected_mode"],
         "parallel_requested": bool(workflow_request.get("parallel_requested", False)),
         "execution_policy": execution_policy,
+        "controller_interpreter": _current_controller_interpreter_resolution(),
         "preflight": _as_dict(runtime_plan.get("gpu_assignment")),
         "runtime_plan": runtime_plan,
         "resolved_workloads": resolved_workloads,
