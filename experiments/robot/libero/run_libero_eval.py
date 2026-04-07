@@ -2,19 +2,6 @@
 run_libero_eval.py
 
 Runs a model in a LIBERO simulation environment.
-
-Usage:
-    # OpenVLA:
-    # IMPORTANT: Set `center_crop=True` if model is fine-tuned with augmentations
-    python experiments/robot/libero/run_libero_eval.py \
-        --model_family openvla \
-        --pretrained_checkpoint <CHECKPOINT_PATH> \
-        --task_suite_name [ libero_spatial | libero_object | libero_goal | libero_10 | libero_90 ] \
-        --center_crop [ True | False ] \
-        --run_id_note <OPTIONAL TAG TO INSERT INTO RUN ID FOR LOGGING> \
-        --use_wandb [ True | False ] \
-        --wandb_project <PROJECT> \
-        --wandb_entity <ENTITY>
 """
 
 # pyright: reportMissingImports=false
@@ -27,7 +14,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
 
-import draccus
 import numpy as np
 import tqdm
 
@@ -45,19 +31,6 @@ from experiments.robot.maniskill.artifacts import (
     write_manifest,
 )
 from experiments.robot.workflow_logging import child_launch_metadata_from_env, emit_breadcrumb, failure_metadata_from_exception
-
-
-DIRECT_LIBERO_WORKLOAD_KEYS = (
-    "openvla_libero",
-    "openvla_libero_ft",
-    "openpi_libero",
-)
-DIRECT_RUNNER_GUIDANCE = (
-    "DIRECT_LIBERO_RUNNER_UNSUPPORTED: launch LIBERO workloads through "
-    "`python3 experiments/robot/interactive_cluster_workflow.py` so the controller owns prompts, "
-    "logging, and failure attribution."
-)
-
 
 def _write_json(path: Path, payload: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -109,9 +82,10 @@ def build_libero_config_from_workflow_request(workflow_request: dict[str, Any]) 
         reason = str(workflow_request.get("cancellation_reason", "USER_CANCELLED"))
         raise ValueError(reason)
 
+    LIBERO_WORKLOAD_KEYS = {"openvla_libero", "openvla_libero_ft", "openpi_libero"}
     selection = str(workflow_request.get("selection", "")).strip()
-    if selection not in DIRECT_LIBERO_WORKLOAD_KEYS:
-        supported = ", ".join(DIRECT_LIBERO_WORKLOAD_KEYS)
+    if selection not in LIBERO_WORKLOAD_KEYS:
+        supported = ", ".join(sorted(LIBERO_WORKLOAD_KEYS))
         raise ValueError(f"UNSUPPORTED_DIRECT_WORKLOAD: {selection or '<blank>'}. Supported values: {supported}")
 
     workload_details = workflow_request.get("workload_details", {})
@@ -474,16 +448,3 @@ def _eval_libero_impl(cfg: GenerateConfig) -> dict[str, Any]:
         raise
     finally:
         log_file.close()
-
-
-@draccus.wrap()
-def eval_libero(cfg: GenerateConfig) -> None:
-    _eval_libero_impl(cfg)
-
-
-if __name__ == "__main__":
-    if len(sys.argv) == 1:
-        print(DIRECT_RUNNER_GUIDANCE)
-        raise SystemExit(1)
-    entrypoint: Any = eval_libero
-    entrypoint()

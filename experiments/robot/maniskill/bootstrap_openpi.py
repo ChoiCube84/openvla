@@ -303,28 +303,6 @@ def _check_policy_server(*, policy_server_url: str, checkpoint: str, openpi_cond
     )
 
 
-def _emit_env_file(path: Path, metadata: RuntimeMetadata) -> None:
-    lines = [
-        f"export OPENPI_REPO_ROOT={shlex.quote(metadata.repo_root)}",
-        f"export OPENVLA_MANISKILL_OPENPI_REPO_ROOT={shlex.quote(metadata.repo_root)}",
-        f"export OPENPI_CONDA_ENV={shlex.quote(metadata.openpi_conda_env)}",
-        f"export OPENVLA_MANISKILL_OPENPI_CONDA_ENV={shlex.quote(metadata.openpi_conda_env)}",
-        f"export OPENPI_POLICY_SERVER_URL={shlex.quote(metadata.policy_server_url)}",
-        f"export OPENVLA_MANISKILL_PI0_POLICY_SERVER_URL={shlex.quote(metadata.policy_server_url)}",
-        f"export OPENPI_BOOTSTRAP_CACHE_STATE={shlex.quote(metadata.cache_state)}",
-        f"export OPENPI_BOOTSTRAP_ACTION={shlex.quote(metadata.bootstrap_action)}",
-        f"export OPENPI_BOOTSTRAP_MARKER={shlex.quote(metadata.bootstrap_marker_path)}",
-        f"export OPENPI_BOOTSTRAP_SOURCE_URL={shlex.quote(metadata.bootstrap_source_url)}",
-        f"export OPENPI_BOOTSTRAP_REF={shlex.quote(metadata.bootstrap_ref)}",
-        f"export OPENPI_BOOTSTRAP_GIT_REVISION={shlex.quote(metadata.git_revision)}",
-        f"export OPENPI_POLICY_SERVER_STATUS={shlex.quote(metadata.policy_server_status)}",
-        f"export OPENPI_POLICY_SERVER_PYTHON={shlex.quote(metadata.policy_server_python)}",
-        f"export OPENPI_POLICY_SERVER_ENTRYPOINT={shlex.quote(metadata.policy_server_entrypoint)}",
-        f"export OPENPI_POLICY_SERVER_LAUNCH_PREFIX={shlex.quote(metadata.policy_server_launch_prefix)}",
-    ]
-    path.write_text("\n".join(lines) + "\n")
-
-
 def _policy_server_python() -> str:
     return "python3"
 
@@ -453,7 +431,6 @@ def parse_args() -> argparse.Namespace:
         "--bootstrap-ref",
         default=os.environ.get("OPENPI_BOOTSTRAP_REF", DEFAULT_OPENPI_BOOTSTRAP_REF),
     )
-    parser.add_argument("--emit-env-file", default="")
     parser.add_argument("--require-policy-server-health", action="store_true")
     return parser.parse_args()
 
@@ -467,11 +444,7 @@ def main() -> int:
         print(f"openpi_error_state={exc.state}")
         print(f"openpi_error_message={exc}")
         return 1
-
-    if args.emit_env_file.strip():
-        env_path = Path(args.emit_env_file).expanduser().resolve()
-        env_path.parent.mkdir(parents=True, exist_ok=True)
-        _emit_env_file(env_path, metadata)
+    
     _print_metadata(metadata)
     return 0
 

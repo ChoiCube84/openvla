@@ -32,16 +32,13 @@ CHECKPOINT_MAP = {
     "openvla_maniskill_ft": "Juelg/openvla-7b-finetuned-maniskill",
     "openpi_maniskill": "gs://openpi-assets/checkpoints/pi05_libero",
     "openvla_libero": "openvla/openvla-7b",
-    "openvla_libero_ft": "Juelg/openvla-7b-finetuned-maniskill",
+    "openvla_libero_ft": "openvla/openvla-7b-finetuned-libero-spatial",
     "openpi_libero": "gs://openpi-assets/checkpoints/pi05_libero",
 }
 LIBERO_TASK_SUITE = "libero_spatial"
 LIBERO_NUM_TRIALS_BY_MODE = {"smoke": 2, "full": 50}
 LIBERO_ARTIFACT_ROOT = "rollouts/libero"
 CANONICAL_PARENT_ARTIFACT_ROOT = "rollouts/cluster_workflow"
-PARENT_WORKFLOW_SUMMARY_TEMPLATE = "rollouts/cluster_workflow/{session_id}/workflow_summary.json"
-PARENT_WORKFLOW_SUMMARY_CONTRACT = "rollouts/cluster_workflow/<session_id>/workflow_summary.json"
-CLEANUP_ORDER = ("introduce", "validate", "remove")
 
 _CONCRETE_WORKFLOW_KEYS = WORKFLOW_KEYS
 _VALID_MODES = set(MODE_KEYS)
@@ -77,25 +74,6 @@ _WORKLOAD_DETAILS = {
         "runner": "experiments/robot/libero/run_libero_eval.py",
         "artifact_root": LIBERO_ARTIFACT_ROOT,
     },
-}
-
-WORKFLOW_DEFAULTS: dict[str, object] = {
-    "canonical_python_entrypoint": "experiments/robot/interactive_cluster_workflow.py",
-    "canonical_maniskill_entrypoint": "experiments/robot/maniskill/run_maniskill_eval.py",
-    "canonical_libero_entrypoint": "experiments/robot/libero/run_libero_eval.py",
-    "canonical_parent_artifact_root": CANONICAL_PARENT_ARTIFACT_ROOT,
-    "parent_workflow_summary_template": PARENT_WORKFLOW_SUMMARY_TEMPLATE,
-    "parent_workflow_summary_contract": PARENT_WORKFLOW_SUMMARY_CONTRACT,
-    "mode_keys": MODE_KEYS,
-    "confirmation_answers": CONFIRMATION_ANSWERS,
-    "default_workload_key": DEFAULT_WORKLOAD_KEY,
-    "default_mode_key": DEFAULT_MODE_KEY,
-    "supported_gpu_numbers": SUPPORTED_GPU_NUMBERS,
-    "checkpoint_map": CHECKPOINT_MAP,
-    "cleanup_order": CLEANUP_ORDER,
-    "libero_task_suite": LIBERO_TASK_SUITE,
-    "libero_num_trials_by_mode": LIBERO_NUM_TRIALS_BY_MODE,
-    "maniskill_episode_count_defaults": dict(MANISKILL_EPISODE_COUNT_DEFAULTS),
 }
 
 
@@ -341,10 +319,6 @@ def build_workflow_request_preview(
         "gpu_number": resolved_gpu_number,
         "gpu_number_defaulted": gpu_number_defaulted,
         "selected_gpu_number": resolved_gpu_number,
-        "canonical_python_entrypoint": WORKFLOW_DEFAULTS["canonical_python_entrypoint"],
-        "parent_workflow_summary_template": PARENT_WORKFLOW_SUMMARY_TEMPLATE,
-        "parent_workflow_summary_contract": PARENT_WORKFLOW_SUMMARY_CONTRACT,
-        "cleanup_order": tuple(CLEANUP_ORDER),
     }
     payload.update(_build_workload_payload(resolved_workloads))
     payload.update(_build_mode_payload(selected_mode))
@@ -470,9 +444,8 @@ def prompt_for_workflow_request(
 
 __all__ = [
     "WORKFLOW_KEYS",
-    "PROMPT_SEQUENCE",
-    "WORKFLOW_DEFAULTS",
-    "build_workflow_request_preview",
+    "CANONICAL_PARENT_ARTIFACT_ROOT",
+    "CHECKPOINT_MAP",
+    "SUPPORTED_GPU_NUMBERS",
     "prompt_for_workflow_request",
-    "validate_workflow_request",
 ]

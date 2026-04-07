@@ -7,7 +7,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
 
-import draccus
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -86,13 +85,6 @@ class ManiSkillEvalConfig:
 
 
 JUELG_MANISKILL_UNNORM_KEY = "maniskill_human:7.0.0"
-DIRECT_MANISKILL_WORKLOAD_KEYS = ("openvla_maniskill_ft", "openpi_maniskill")
-DIRECT_RUNNER_GUIDANCE = (
-    "DIRECT_MANISKILL_RUNNER_UNSUPPORTED: launch ManiSkill workloads through "
-    "`python3 experiments/robot/interactive_cluster_workflow.py` so the controller owns prompts, "
-    "logging, and failure attribution."
-)
-
 
 def _parse_task_ids(task_ids_csv: str) -> list[str]:
     requested = [task_id.strip() for task_id in task_ids_csv.split(",") if task_id.strip()]
@@ -309,9 +301,10 @@ def build_maniskill_config_from_workflow_request(workflow_request: dict[str, Any
         reason = str(workflow_request.get("cancellation_reason", "USER_CANCELLED"))
         raise ValueError(reason)
 
+    MANISKILL_WORKLOAD_KEYS = {"openvla_maniskill_ft", "openpi_maniskill"}
     selection = str(workflow_request.get("selection", "")).strip()
-    if selection not in DIRECT_MANISKILL_WORKLOAD_KEYS:
-        supported = ", ".join(DIRECT_MANISKILL_WORKLOAD_KEYS)
+    if selection not in MANISKILL_WORKLOAD_KEYS:
+        supported = ", ".join(sorted(MANISKILL_WORKLOAD_KEYS))
         raise ValueError(f"UNSUPPORTED_DIRECT_WORKLOAD: {selection or '<blank>'}. Supported values: {supported}")
 
     workload_details = workflow_request.get("workload_details", {})
@@ -674,17 +667,3 @@ def _eval_maniskill_impl(cfg: ManiSkillEvalConfig) -> dict[str, Any]:
         raise
     finally:
         log_file.close()
-
-
-@draccus.wrap()
-def eval_maniskill(cfg: ManiSkillEvalConfig) -> None:
-    _eval_maniskill_impl(cfg)
-
-
-if __name__ == "__main__":
-    if len(sys.argv) == 1:
-        print(DIRECT_RUNNER_GUIDANCE)
-        raise SystemExit(1)
-    else:
-        entrypoint: Any = eval_maniskill
-        entrypoint()

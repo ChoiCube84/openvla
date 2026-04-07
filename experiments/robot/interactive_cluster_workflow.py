@@ -34,32 +34,12 @@ from experiments.robot.workflow_logging import (
     WORKFLOW_WORKLOAD_KEY_ENV_KEY,
     append_breadcrumb_block,
     failure_metadata_from_exception,
-    failure_metadata_from_output,
     iso_timestamp,
 )
 
 PARENT_SUMMARY_FILENAME = "workflow_summary.json"
 RUNTIME_PLAN_FILENAME = "runtime_plan.json"
-CHILD_STDOUT_KEYS = (
-    "summary_path",
-    "manifest_path",
-    "episodes_path",
-    "average_success_rate",
-    "run_dir",
-    "launch_path",
-    "workload_key",
-    "benchmark",
-    "model_family",
-    "controller_python",
-    "effective_workload_python",
-    "selected_gpu",
-    "selected_cuda_visible_devices",
-    "failure_phase",
-    "failure_location",
-    "exception_type",
-    "exception_message",
-    "traceback_tail",
-)
+
 OPENPI_BOOTSTRAP_STDOUT_KEYS = (
     "openpi_runtime_status",
     "openpi_error_state",
@@ -83,7 +63,6 @@ OPENPI_BOOTSTRAP_STDOUT_KEYS = (
 )
 MANISKILL_WORKLOADS = {"openvla_maniskill_ft", "openpi_maniskill"}
 LIBERO_WORKLOADS = {"openvla_libero", "openvla_libero_ft", "openpi_libero"}
-INPROCESS_WORKLOADS = MANISKILL_WORKLOADS | LIBERO_WORKLOADS
 MANAGED_OPENPI_POLICY_SERVER_WORKLOADS = {"openpi_maniskill", "openpi_libero"}
 DEFAULT_OPENPI_POLICY_CONFIG = "pi05_libero"
 POLICY_SERVER_HEALTH_TIMEOUT_SECONDS = 45.0
@@ -111,7 +90,7 @@ def _write_json(path: Path, payload: dict[str, Any]) -> Path:
     return path
 
 
-def _parse_key_values(text: str, keys: tuple[str, ...] = CHILD_STDOUT_KEYS) -> dict[str, str]:
+def _parse_key_values(text: str, keys: tuple[str, ...]) -> dict[str, str]:
     parsed = {key: "" for key in keys}
     for line in text.splitlines():
         for key in keys:
@@ -127,19 +106,6 @@ def _tail_nonempty_line(text: str) -> str:
         if stripped:
             return stripped
     return "no_output"
-
-
-def _load_summary_payload(summary_path: str) -> dict[str, Any] | None:
-    if not summary_path:
-        return None
-    path = Path(summary_path)
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text())
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
 
 
 def _as_string_list(value: object) -> list[str]:
@@ -170,14 +136,6 @@ def _controller_prompt_input(prompt: str) -> str:
         return input(prompt)
     except EOFError as exc:
         raise ValueError(_controller_input_required_message()) from exc
-
-
-def _tail_lines(text: str, *, keep: int = 6) -> str:
-    nonempty = [line.strip() for line in text.splitlines() if line.strip()]
-    if not nonempty:
-        return "no_output"
-    return " | ".join(nonempty[-keep:])
-
 
 def _describe_controller_interpreter(resolution: dict[str, Any]) -> str:
     status = str(resolution.get("status") or "active")
@@ -210,8 +168,9 @@ def _current_controller_interpreter_resolution() -> dict[str, Any]:
     }
 
 
-def _build_parent_paths(session_id: str) -> dict[str, Path]:
-    session_dir = Path(CANONICAL_PARENT_ARTIFACT_ROOT) / session_id
+def _build_parent_paths(session_id: str, artifact_root: str | None = None) -> dict[str, Path]:
+    root = artifact_root if artifact_root else CANONICAL_PARENT_ARTIFACT_ROOT
+    session_dir = Path(root) / session_id
     return {
         "session_dir": session_dir,
         "summary_path": session_dir / PARENT_SUMMARY_FILENAME,
@@ -351,6 +310,23 @@ def _resolve_gpu_assignment(
         return assignment
 
     selected_cuda_visible_devices = requested_gpu_number
+
+    gpu_index = int(requested_gpu_number)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            visible_count = torch.cuda.device_count()
+            if gpu_index >= visible_count:
+                assignment["status"] = "blocked"
+                assignment["blocker"] = (
+                    f"INVALID_GPU_NUMBER: GPU {gpu_index} requested but only "
+                    f"{visible_count} GPU(s) visible to this process."
+                )
+                assignment["reason"] = "Requested GPU index exceeds visible device count."
+                return assignment
+    except Exception:
+        pass  # torch 없거나 CUDA 없는 환경은 cluster-only 실행으로 간주하고 통과
+
     assignment["selection_trace"] = ["using explicit workflow_request.selected_gpu_number without controller-visible gating"]
     assignment["selected_gpu"] = requested_gpu_number
     assignment["selected_cuda_visible_devices"] = selected_cuda_visible_devices
@@ -413,8 +389,32 @@ def _estimated_work_payload(workload_key: str, runtime_estimate: dict[str, Any])
 
 
 def _integrated_workflow_blockers(workflow_request: dict[str, Any]) -> list[dict[str, Any]]:
-    return []
+    blockers = []
+    resolved_workloads = _as_string_list(workflow_request.get("resolved_workloads"))
 
+    # OpenPI 워크로드 포함 시 conda 및 환경 확인
+    openpi_workloads = [w for w in resolved_workloads if w in MANAGED_OPENPI_POLICY_SERVER_WORKLOADS]
+    if openpi_workloads:
+        if not shutil.which("conda"):
+            blockers.append({
+                "workload_key": ",".join(openpi_workloads),
+                "blocker": "CONDA_NOT_FOUND: `conda` executable not on PATH; required for OpenPI workloads.",
+            })
+        openpi_repo_root = _resolve_openpi_repo_root()
+        if not openpi_repo_root and not _managed_repo_root_exists():
+            blockers.append({
+                "workload_key": ",".join(openpi_workloads),
+                "blocker": "OPENPI_REPO_NOT_FOUND: no OPENPI_REPO_ROOT set and no managed cache exists yet.",
+            })
+
+    return blockers
+
+def _managed_repo_root_exists() -> bool:
+    try:
+        from experiments.robot.maniskill.bootstrap_openpi import _managed_repo_root
+        return _managed_repo_root().exists()
+    except Exception:
+        return False
 
 def _build_runtime_plan(
     workflow_request: dict[str, Any],
@@ -422,7 +422,6 @@ def _build_runtime_plan(
     parent_paths: dict[str, Path],
     *,
     gpu_prompt_context: dict[str, Any] | None = None,
-    write_output: bool = True,
 ) -> dict[str, Any]:
     resolved_workloads = _as_string_list(workflow_request.get("resolved_workloads"))
     controller_interpreter = _current_controller_interpreter_resolution()
@@ -479,8 +478,7 @@ def _build_runtime_plan(
             "session_dir": str(parent_paths["session_dir"]),
         },
     }
-    if write_output:
-        _write_json(parent_paths["runtime_plan_path"], plan_payload)
+    _write_json(parent_paths["runtime_plan_path"], plan_payload)
     return plan_payload
 
 
@@ -555,16 +553,6 @@ def _controller_launch_metadata(
         "selected_gpu": gpu_assignment.get("selected_gpu"),
         "selected_cuda_visible_devices": gpu_assignment.get("selected_cuda_visible_devices"),
     }
-
-
-def _append_subprocess_output(log_path: Path, output_text: str) -> None:
-    if not output_text:
-        return
-    with log_path.open("a") as f:
-        if not output_text.endswith("\n"):
-            output_text = f"{output_text}\n"
-        f.write(output_text)
-
 
 def _write_controller_event(controller_log_path: Path, payload: dict[str, Any], *, heading: str) -> None:
     append_breadcrumb_block(controller_log_path, payload, heading=heading)
@@ -696,54 +684,6 @@ def _resolve_child_artifact_root(workflow_request: dict[str, Any], workload_key:
     return str(detail.get("artifact_root", "")).strip()
 
 
-def _build_preview_runtime_plan(
-    workflow_request: dict[str, Any],
-    *,
-    gpu_prompt_context: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    parent_paths = {
-        "runtime_plan_path": Path(CANONICAL_PARENT_ARTIFACT_ROOT) / "<pending_confirmation>" / RUNTIME_PLAN_FILENAME,
-        "summary_path": Path(CANONICAL_PARENT_ARTIFACT_ROOT) / "<pending_confirmation>" / PARENT_SUMMARY_FILENAME,
-        "session_dir": Path(CANONICAL_PARENT_ARTIFACT_ROOT) / "<pending_confirmation>",
-    }
-    runtime_plan = _build_runtime_plan(
-        workflow_request,
-        "PENDING_CONFIRMATION",
-        parent_paths,
-        gpu_prompt_context=gpu_prompt_context,
-        write_output=False,
-    )
-    runtime_plan["preview_only"] = True
-    runtime_plan["artifact_paths"] = {
-        "runtime_plan_path": None,
-        "workflow_summary_path": None,
-        "session_dir": None,
-    }
-    return runtime_plan
-
-
-def _emit_plan_preview(
-    workflow_request: dict[str, Any],
-    *,
-    gpu_prompt_context: dict[str, Any] | None = None,
-) -> None:
-    runtime_plan = _build_preview_runtime_plan(workflow_request, gpu_prompt_context=gpu_prompt_context)
-    gpu_assignment = _as_dict(runtime_plan.get("gpu_assignment"))
-    preview_payload = {
-        "status": runtime_plan.get("status"),
-        "selected_mode": workflow_request.get("selected_mode"),
-        "artifact_root_overridden": workflow_request.get("artifact_root_overridden"),
-        "requested_artifact_root": workflow_request.get("artifact_root"),
-        "gpu_heavy_execution": runtime_plan.get("gpu_heavy_execution"),
-        "selected_gpu": gpu_assignment.get("selected_gpu"),
-        "selected_cuda_visible_devices": gpu_assignment.get("selected_cuda_visible_devices"),
-        "gpu_assignment": gpu_assignment,
-        "workflow_blockers": runtime_plan.get("workflow_blockers"),
-        "planned_workloads": runtime_plan.get("planned_workloads"),
-    }
-    print(f"workflow_plan_preview={_json_dumps_compact(preview_payload)}")
-
-
 def _resolve_openpi_policy_server_url() -> str:
     return (
         os.environ.get("OPENVLA_MANISKILL_PI0_POLICY_SERVER_URL")
@@ -867,20 +807,6 @@ def _openpi_teardown_result(*, process_started: bool, result: dict[str, Any] | N
             "returncode": None,
         }
     return {"process_started": process_started, **result}
-
-
-def _build_command(
-    workflow_request: dict[str, Any],
-    workload_key: str,
-    session_id: str,
-) -> list[str]:
-    if workload_key in MANISKILL_WORKLOADS:
-        raise ValueError(f"MANISKILL_INPROCESS_REQUIRED: {workload_key}")
-
-    if workload_key in LIBERO_WORKLOADS:
-        raise ValueError(f"LIBERO_INPROCESS_REQUIRED: {workload_key}")
-
-    raise ValueError(f"UNSUPPORTED_WORKLOAD: {workload_key}")
 
 
 def _build_openpi_bootstrap_command(*, checkpoint: str, policy_server_url: str, require_policy_server_health: bool) -> list[str]:
@@ -1415,110 +1341,6 @@ def _failed_execution_result(
     child["blocker_reason"] = error_message
     return child
 
-
-def _parse_child_result(*, workload_key: str, command: list[str], output_text: str, exit_code: int, log_path: Path) -> dict[str, Any]:
-    parsed_stdout = _parse_key_values(output_text)
-    parsed_selected_gpu = parsed_stdout.get("selected_gpu") or None
-    parsed_selected_cuda_visible_devices = parsed_stdout.get("selected_cuda_visible_devices") or parsed_selected_gpu
-    summary_path = parsed_stdout.get("summary_path", "")
-    summary_payload = _load_summary_payload(summary_path)
-    manifest_path = parsed_stdout.get("manifest_path", "")
-    episodes_path = parsed_stdout.get("episodes_path", "")
-    run_dir = parsed_stdout.get("run_dir", "")
-    average_success_rate: float | None = None
-    checkpoint = None
-    artifact_paths: dict[str, Any] = {}
-    per_task_success_rate: dict[str, Any] = {}
-    blocker_reason = None
-    subprocess_detail = shlex.join(command)
-
-    if parsed_stdout.get("average_success_rate"):
-        try:
-            average_success_rate = float(parsed_stdout["average_success_rate"])
-        except Exception:
-            average_success_rate = None
-
-    if summary_payload is not None:
-        if average_success_rate is None:
-            raw_average = summary_payload.get("average_success_rate")
-            if raw_average is not None:
-                try:
-                    average_success_rate = float(raw_average)
-                except Exception:
-                    average_success_rate = None
-        if not manifest_path:
-            manifest_path = str(summary_payload.get("artifact_paths", {}).get("manifest", ""))
-        if not episodes_path:
-            episodes_path = str(summary_payload.get("artifact_paths", {}).get("episodes", ""))
-        if not run_dir:
-            run_dir = str(summary_payload.get("artifact_paths", {}).get("run_dir", ""))
-        checkpoint = summary_payload.get("checkpoint")
-        raw_artifact_paths = summary_payload.get("artifact_paths")
-        if isinstance(raw_artifact_paths, dict):
-            artifact_paths = dict(raw_artifact_paths)
-        raw_per_task = summary_payload.get("per_task_success_rate")
-        if isinstance(raw_per_task, dict):
-            per_task_success_rate = dict(raw_per_task)
-
-    if exit_code == 0 and summary_path:
-        status = "complete"
-        failure_details = {
-            "failure_phase": None,
-            "failure_location": None,
-            "exception_type": None,
-            "exception_message": None,
-            "traceback_tail": None,
-            "subprocess_detail": subprocess_detail,
-        }
-    elif exit_code == 0:
-        status = "failed"
-        blocker_reason = "missing_summary_path_from_child_stdout"
-        failure_details = failure_metadata_from_output(
-            output_text,
-            failure_phase="child_summary_validation",
-            subprocess_detail=subprocess_detail,
-            fallback_exception_message=blocker_reason,
-        )
-    else:
-        status = "failed"
-        blocker_reason = _tail_nonempty_line(output_text)
-        failure_details = failure_metadata_from_output(
-            output_text,
-            failure_phase="child_subprocess_execution",
-            subprocess_detail=subprocess_detail,
-            fallback_exception_message=blocker_reason,
-        )
-
-    return {
-        "workload_key": workload_key,
-        "status": status,
-        "exit_code": exit_code,
-        "blocker_reason": blocker_reason,
-        "command": command,
-        "summary_path": summary_path or None,
-        "manifest_path": manifest_path or None,
-        "episodes_path": episodes_path or None,
-        "run_dir": run_dir or None,
-        "checkpoint": checkpoint,
-        "average_success_rate": average_success_rate,
-        "per_task_success_rate": per_task_success_rate,
-        "artifact_paths": artifact_paths,
-        "log_path": str(log_path),
-        "parsed_stdout": parsed_stdout,
-        "failure_phase": parsed_stdout.get("failure_phase") or failure_details.get("failure_phase"),
-        "failure_location": parsed_stdout.get("failure_location") or failure_details.get("failure_location"),
-        "exception_type": parsed_stdout.get("exception_type") or failure_details.get("exception_type"),
-        "exception_message": parsed_stdout.get("exception_message") or failure_details.get("exception_message"),
-        "traceback_tail": parsed_stdout.get("traceback_tail") or failure_details.get("traceback_tail"),
-        "subprocess_detail": failure_details.get("subprocess_detail"),
-        "launch_path": parsed_stdout.get("launch_path") or None,
-        "controller_python": parsed_stdout.get("controller_python") or None,
-        "effective_workload_python": parsed_stdout.get("effective_workload_python") or None,
-        "selected_gpu": parsed_selected_gpu,
-        "selected_cuda_visible_devices": parsed_selected_cuda_visible_devices,
-    }
-
-
 def _build_maniskill_inprocess_command() -> list[str]:
     return ["controller_inprocess", "experiments.robot.maniskill.run_maniskill_eval:_eval_maniskill_impl"]
 
@@ -1560,7 +1382,9 @@ def _run_maniskill_inprocess(
     try:
         with _temporary_env(child_env):
             maniskill_runner = importlib.import_module("experiments.robot.maniskill.run_maniskill_eval")
-            cfg = maniskill_runner.build_maniskill_config_from_workflow_request(workflow_request)
+            cfg = maniskill_runner.build_maniskill_config_from_workflow_request(
+                {**workflow_request, "selection": workload_key}
+            )
             cfg.run_id_note = f"{session_id}--{workload_key}"
             cfg.controller_log_path = str(log_path)
             result = maniskill_runner._eval_maniskill_impl(cfg)
@@ -1663,7 +1487,9 @@ def _run_libero_inprocess(
     try:
         with _temporary_env(child_env):
             libero_runner = importlib.import_module("experiments.robot.libero.run_libero_eval")
-            cfg = libero_runner.build_libero_config_from_workflow_request(workflow_request)
+            cfg = libero_runner.build_libero_config_from_workflow_request(
+                {**workflow_request, "selection": workload_key}
+            )
             cfg.run_id_note = f"{session_id}--{workload_key}"
             cfg.controller_log_path = str(log_path)
             cfg.use_wandb = False
@@ -1753,20 +1579,16 @@ def _execute_workload(
         _build_maniskill_inprocess_command()
         if workload_key in MANISKILL_WORKLOADS
         else _build_libero_inprocess_command()
-        if workload_key in LIBERO_WORKLOADS
-        else _build_command(workflow_request, workload_key, session_id)
     )
     child_env = _build_child_env(runtime_plan)
     launch_metadata = _controller_launch_metadata(
         workload_key=workload_key,
         workflow_request=workflow_request,
         runtime_plan=runtime_plan,
-        launch_path="controller_inprocess" if workload_key in INPROCESS_WORKLOADS else "controller_subprocess",
-        effective_workload_python=sys.executable if workload_key in INPROCESS_WORKLOADS else (command[0] if command else None),
+        launch_path="controller_inprocess",
+        effective_workload_python=sys.executable,
     )
     append_breadcrumb_block(log_path, launch_metadata, heading="launch")
-    if workload_key not in INPROCESS_WORKLOADS:
-        child_env = _apply_workload_child_env(child_env, launch_metadata, workload_key=workload_key)
 
     if workload_key in MANAGED_OPENPI_POLICY_SERVER_WORKLOADS:
         checkpoint = str(workflow_request["checkpoint_map"][workload_key])
@@ -1793,12 +1615,6 @@ def _execute_workload(
                 openpi_checkpoint=checkpoint,
             )
             child_env = _apply_workload_child_env(child_env, launch_metadata, workload_key=workload_key)
-            if workload_key not in INPROCESS_WORKLOADS:
-                command = _build_command(
-                    workflow_request,
-                    workload_key,
-                    session_id,
-                )
         except Exception as exc:
             if isinstance(exc, ManagedOpenPILifecycleError):
                 payload = dict(exc.payload)
@@ -1872,42 +1688,6 @@ def _execute_workload(
                 managed_openpi_runtime=managed_openpi_runtime,
             )
             process_returncode = int(child["exit_code"])
-        else:
-            process = subprocess.run(
-                command,
-                cwd=REPO_ROOT,
-                env=child_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=False,
-            )
-            process_returncode = process.returncode
-            output_text = process.stdout or ""
-            _append_subprocess_output(log_path, output_text)
-            child = _parse_child_result(
-                workload_key=workload_key,
-                command=command,
-                output_text=output_text,
-                exit_code=process.returncode,
-                log_path=log_path,
-            )
-            if child["status"] != "complete":
-                append_breadcrumb_block(
-                    log_path,
-                    {
-                        **launch_metadata,
-                        "timestamp": iso_timestamp(),
-                        "effective_workload_python": child.get("effective_workload_python") or launch_metadata.get("effective_workload_python"),
-                        "failure_phase": child.get("failure_phase"),
-                        "failure_location": child.get("failure_location"),
-                        "exception_type": child.get("exception_type"),
-                        "exception_message": child.get("exception_message"),
-                        "traceback_tail": child.get("traceback_tail"),
-                        "subprocess_detail": child.get("subprocess_detail"),
-                    },
-                    heading="failure",
-                )
         teardown_reason = "child_complete" if child["status"] == "complete" else "child_failed"
     except KeyboardInterrupt:
         teardown_reason = "cancelled"
@@ -1986,7 +1766,8 @@ def _run_controller() -> int:
         return 0
 
     session_id = _build_session_id()
-    parent_paths = _build_parent_paths(session_id)
+    requested_root = str(workflow_request.get("artifact_root", "")).strip() or None
+    parent_paths = _build_parent_paths(session_id, artifact_root=requested_root)
     session_dir = parent_paths["session_dir"]
     session_dir.mkdir(parents=True, exist_ok=True)
     controller_log_path = parent_paths["controller_log_path"]
