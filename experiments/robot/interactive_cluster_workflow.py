@@ -688,7 +688,7 @@ def _resolve_openpi_policy_server_url() -> str:
     return (
         os.environ.get("OPENVLA_MANISKILL_PI0_POLICY_SERVER_URL")
         or os.environ.get("OPENPI_POLICY_SERVER_URL")
-        or "http://127.0.0.1:8000"
+        or "http://127.0.0.1:8001"
     ).strip()
 
 
@@ -857,29 +857,31 @@ def _run_openpi_bootstrap_command(
 
 
 def _build_openpi_policy_server_command(metadata: dict[str, str]) -> list[str]:
-    conda_executable = shutil.which("conda")
-    if not conda_executable:
-        raise RuntimeError("OPENPI_POLICY_SERVER_STARTUP_FAILED: `conda` executable not found for managed OpenPI env startup.")
+    # entrypoint = metadata.get("openpi_policy_server_entrypoint", "").strip()
+    # if not entrypoint:
+    #     raise RuntimeError("OPENPI_POLICY_SERVER_STARTUP_FAILED: bootstrap metadata did not include a policy server entrypoint.")
+    
+    # For 127.0.0.1 hsot
+    local_entrypoint = str(Path(__file__).parent / "serve_policy_local.py")
 
-    entrypoint = metadata.get("openpi_policy_server_entrypoint", "").strip()
-    if not entrypoint:
-        raise RuntimeError("OPENPI_POLICY_SERVER_STARTUP_FAILED: bootstrap metadata did not include a policy server entrypoint.")
-
-    python_executable = metadata.get("openpi_policy_server_python", "python3").strip() or "python3"
     checkpoint = metadata.get("openpi_checkpoint", "").strip()
     policy_config = _resolve_openpi_policy_config(checkpoint)
-    return [
-        conda_executable,
-        "run",
-        "--no-capture-output",
-        "-n",
-        metadata.get("openpi_conda_env", "openpi").strip() or "openpi",
-        python_executable,
-        entrypoint,
+    uv_python = str(Path.home() / ".cache/openvla/openpi/.venv/bin/python")
+    cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    cmd = []
+    if cuda_devices:
+        cmd = ["env", f"CUDA_VISIBLE_DEVICES={cuda_devices}"]
+    cmd += [
+        uv_python,
+        # entrypoint,
+        local_entrypoint,
+        "--host", "127.0.0.1",
+        "--port", "8001",
         "policy:checkpoint",
         f"--policy.config={policy_config}",
         f"--policy.dir={checkpoint}",
     ]
+    return cmd
 
 
 def _terminate_process(process: subprocess.Popen[Any], *, grace_seconds: float = 10.0) -> dict[str, Any]:
@@ -907,26 +909,24 @@ def _wait_for_openpi_policy_server_health(
     env: dict[str, str] | None,
     timeout_seconds: float = POLICY_SERVER_HEALTH_TIMEOUT_SECONDS,
 ) -> tuple[bool, str, dict[str, str]]:
+    import socket
     deadline = time.time() + timeout_seconds
-    last_output = ""
-    last_parsed: dict[str, str] = {key: "" for key in OPENPI_BOOTSTRAP_STDOUT_KEYS}
     while time.time() < deadline:
         if process.poll() is not None:
             message = log_path.read_text() if log_path.exists() else ""
-            return False, message, last_parsed
-        returncode, output_text, parsed = _run_openpi_bootstrap_command(
-            checkpoint=checkpoint,
-            policy_server_url=policy_server_url,
-            require_policy_server_health=True,
-            log_path=log_path,
-            env=env,
-        )
-        last_output = output_text
-        last_parsed = parsed
-        if returncode == 0 and parsed.get("openpi_policy_server_status") == "healthy":
-            return True, output_text, parsed
+            return False, message, {key: "" for key in OPENPI_BOOTSTRAP_STDOUT_KEYS}
+        try:
+            host = policy_server_url.split("//")[1].split(":")[0]
+            port = int(policy_server_url.split(":")[-1])
+            with socket.create_connection((host, port), timeout=1):
+                return True, "port_open", {
+                    **{key: "" for key in OPENPI_BOOTSTRAP_STDOUT_KEYS},
+                    "openpi_policy_server_status": "healthy",
+                }
+        except OSError:
+            pass
         time.sleep(POLICY_SERVER_HEALTH_POLL_SECONDS)
-    return False, last_output, last_parsed
+    return False, "", {key: "" for key in OPENPI_BOOTSTRAP_STDOUT_KEYS}
 
 
 def _start_managed_openpi_policy_server(

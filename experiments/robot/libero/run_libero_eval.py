@@ -214,6 +214,9 @@ def _eval_libero_impl(cfg: GenerateConfig) -> dict[str, Any]:
         log_file.write(f"Task suite: {cfg.task_suite_name}\n")
 
         resize_size = get_image_resize_size(cfg)
+        if cfg.model_family == "pi0":
+            resize_size = 256
+            
         total_episodes, total_successes = 0, 0
         task_labels: list[str] = []
         task_descriptions: dict[str, str] = {}
@@ -267,11 +270,26 @@ def _eval_libero_impl(cfg: GenerateConfig) -> dict[str, Any]:
                                 t += 1
                                 continue
 
-                            img = get_libero_image(obs, resize_size)
+                            if cfg.model_family == "pi0":
+                                from openpi_client import image_tools
+                                img = image_tools.convert_to_uint8(
+                                    image_tools.resize_with_pad(
+                                        np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]), 224, 224
+                                    )
+                                )
+                                wrist_img = image_tools.convert_to_uint8(
+                                    image_tools.resize_with_pad(
+                                        np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1]), 224, 224
+                                    )
+                                )
+                            else:
+                                img = get_libero_image(obs, resize_size)
+                                wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                            
                             replay_images.append(img)
-
                             observation = {
                                 "full_image": img,
+                                "wrist_image": wrist_img,
                                 "state": np.concatenate(
                                     (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
                                 ),
@@ -284,8 +302,9 @@ def _eval_libero_impl(cfg: GenerateConfig) -> dict[str, Any]:
                                 task_description,
                                 processor=processor,
                             )
-                            action = normalize_gripper_action(action, binarize=True)
+                            
                             if cfg.model_family == "openvla":
+                                action = normalize_gripper_action(action, binarize=True)
                                 action = invert_gripper_action(action)
 
                             obs, _, done, _ = env.step(action.tolist())
