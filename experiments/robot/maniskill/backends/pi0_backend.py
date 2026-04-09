@@ -87,12 +87,6 @@ class Pi0Backend:
         return canonicalize_action(action, backend_id=self.metadata.backend_id)
 
     def get_action(self, cfg: Any, model: Any, obs: dict[str, Any], task_label: str, processor: Any = None):
-        import pathlib
-        pathlib.Path("/home/jwchoi84/openvla/env_debug.log").open("a").write(
-            "\n".join(f"{k}={v}" for k, v in os.environ.items() if any(x in k.lower() for x in ["proxy", "http", "ws", "cuda", "openpi"]))
-            + "\n---\n"
-        )
-        
         cached = self._next_cached_action(task_label)
         if cached is not None:
             return cached
@@ -125,15 +119,8 @@ class Pi0Backend:
         }
 
         REPLAN_STEPS = 5  # openpi 예제랑 맞춤
-
-        result = client.infer(obs_payload)
+        result = self._client.infer(obs_payload)
         actions = np.asarray(result["actions"], dtype=np.float32)
-
-        # 디버그 로그
-        import pathlib
-        pathlib.Path("/home/jwchoi84/openvla/pi0_debug.log").open("a").write(
-            f"actions[0]={actions[0].tolist()}, shape={list(actions.shape)}\n"
-        )
 
         chunk = [actions[i] for i in range(min(REPLAN_STEPS, len(actions)))]
         if len(chunk) > 1:
