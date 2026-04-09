@@ -64,13 +64,12 @@ class Pi0Backend:
                 pass
 
     def get_model(self, cfg: Any):
-        from openpi_client.websocket_client_policy import WebsocketClientPolicy
         runtime = _resolve_runtime_config(cfg)
         self._runtime = runtime
         self._reset_chunk_cache()
         self._active_task_label = None
-        self._client = WebsocketClientPolicy(host=runtime.host, port=runtime.port)
-        return self._client
+        self._client = None  # 연결 안 함, get_action에서 lazy 연결
+        return runtime  # client 대신 runtime 반환
 
     def get_processor(self, cfg: Any):
         return None
@@ -88,16 +87,20 @@ class Pi0Backend:
         return canonicalize_action(action, backend_id=self.metadata.backend_id)
 
     def get_action(self, cfg: Any, model: Any, obs: dict[str, Any], task_label: str, processor: Any = None):
+        import pathlib
+        pathlib.Path("/home/jwchoi84/openvla/env_debug.log").open("a").write(
+            "\n".join(f"{k}={v}" for k, v in os.environ.items() if any(x in k.lower() for x in ["proxy", "http", "ws", "cuda", "openpi"]))
+            + "\n---\n"
+        )
+        
         cached = self._next_cached_action(task_label)
         if cached is not None:
             return cached
 
-        client = self._client
-        if client is None:
+        if self._client is None:
             from openpi_client.websocket_client_policy import WebsocketClientPolicy
-            runtime = _resolve_runtime_config(cfg)
-            client = WebsocketClientPolicy(host=runtime.host, port=runtime.port)
-            self._client = client
+            runtime = self._runtime or _resolve_runtime_config(cfg)
+            self._client = WebsocketClientPolicy(host=runtime.host, port=runtime.port)
 
         img = np.asarray(obs["full_image"], dtype=np.uint8)
         wrist_raw = obs.get("wrist_image", np.zeros((224, 224, 3), dtype=np.uint8))
